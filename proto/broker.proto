@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package broker;
+
+option go_package = "pipeline/proto";
+
+service Broker {
+  rpc Submit(SubmitRequest)         returns (SubmitResponse);
+  rpc GetResult(GetResultRequest)   returns (GetResultResponse);
+  rpc Poll(PollRequest)             returns (PollResponse);
+  rpc Complete(CompleteRequest)     returns (CompleteResponse);
+  rpc Heartbeat(HeartbeatRequest)   returns (HeartbeatResponse);
+}
+
+message Task {
+  string id      = 1;
+  string payload = 2;
+}
+
+message SubmitRequest  { string payload  = 1; }
+message SubmitResponse { string task_id  = 1; }
+
+message PollRequest    { string worker_id = 1; }
+message PollResponse   { Task task = 1; bool has_task = 2; }
+
+message CompleteRequest  { string task_id = 1; string worker_id = 2; string error = 3; }
+message CompleteResponse { bool ok = 1; }
+
+message HeartbeatRequest  { string worker_id = 1; string task_id = 2; }
+message HeartbeatResponse { bool ok = 1; }
+
+message GetResultRequest  { string task_id = 1; }
+message GetResultResponse { bool done = 1; string error = 2; }
