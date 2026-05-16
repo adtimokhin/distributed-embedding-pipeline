@@ -34,7 +34,7 @@ const (
 // ──────────────────────────────────────────────────────────────────────────────
 
 type inFlightEntry struct {
-	task          pb.Task
+	task          *pb.Task
 	workerID      string
 	lastHeartbeat time.Time // Stage 2: updated by Heartbeat RPCs
 }
@@ -43,7 +43,7 @@ type brokerServer struct {
 	pb.UnimplementedBrokerServer
 
 	mu       sync.Mutex
-	pending  []pb.Task                 // tasks waiting to be assigned
+	pending  []*pb.Task                // tasks waiting to be assigned
 	inflight map[string]*inFlightEntry // task_id → entry
 	errors   map[string]string         // task_id → error string (empty = success)
 	done     map[string]bool           // task_id → completed?
@@ -63,30 +63,64 @@ func newBrokerServer() *brokerServer {
 
 // Submit enqueues a new task and returns its assigned ID.
 func (s *brokerServer) Submit(_ context.Context, req *pb.SubmitRequest) (*pb.SubmitResponse, error) {
-	// TODO (Stage 1): assign a UUID, append a Task to s.pending, return the ID.
-	_ = uuid.New() // hint: use uuid.New().String()
-	return nil, fmt.Errorf("Submit: not implemented")
+	id := uuid.New().String()
+	task := &pb.Task{Id: id, Payload: req.Payload}
+
+	s.mu.Lock()
+	s.pending = append(s.pending, task)
+	s.mu.Unlock()
+
+	return &pb.SubmitResponse{TaskId: id}, nil
 }
 
 // Poll returns one pending task to the calling worker, or has_task=false if
 // the queue is empty.
 func (s *brokerServer) Poll(_ context.Context, req *pb.PollRequest) (*pb.PollResponse, error) {
-	// TODO (Stage 1): dequeue head of s.pending, move to s.inflight, return task.
-	// If queue is empty, return &pb.PollResponse{HasTask: false}.
-	return nil, fmt.Errorf("Poll: not implemented")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.pending) == 0 {
+		return &pb.PollResponse{HasTask: false}, nil
+	}
+
+	task := s.pending[0]
+	s.pending = s.pending[1:]
+	s.inflight[task.Id] = &inFlightEntry{
+		task:          task,
+		workerID:      req.WorkerId,
+		lastHeartbeat: time.Now(),
+	}
+
+	return &pb.PollResponse{Task: task, HasTask: true}, nil
 }
 
 // Complete records that a worker finished a task (successfully or with error).
 func (s *brokerServer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteResponse, error) {
-	// TODO (Stage 1): move task from s.inflight to s.done / s.errors.
-	// If task_id is unknown or already done, treat as a no-op (return ok=true).
-	return nil, fmt.Errorf("Complete: not implemented")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, inflight := s.inflight[req.TaskId]; !inflight {
+		// Unknown or already done — no-op.
+		return &pb.CompleteResponse{Ok: true}, nil
+	}
+
+	delete(s.inflight, req.TaskId)
+	s.done[req.TaskId] = true
+	s.errors[req.TaskId] = req.Error
+
+	return &pb.CompleteResponse{Ok: true}, nil
 }
 
 // GetResult reports whether a task is done and, if so, any error.
 func (s *brokerServer) GetResult(_ context.Context, req *pb.GetResultRequest) (*pb.GetResultResponse, error) {
-	// TODO (Stage 1): check s.done[task_id]; return done=true if present.
-	return nil, fmt.Errorf("GetResult: not implemented")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.done[req.TaskId] {
+		return &pb.GetResultResponse{Done: false}, nil
+	}
+
+	return &pb.GetResultResponse{Done: true, Error: s.errors[req.TaskId]}, nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

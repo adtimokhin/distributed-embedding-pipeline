@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	pb "pipeline/proto"
@@ -47,13 +49,16 @@ type taskPayload struct {
 // chunkText splits text into passages of at most maxWords words.
 // Word boundaries are Unicode whitespace.
 func chunkText(text string, maxWords int) []string {
-	// TODO (Stage 1): split text into tokens on whitespace; accumulate tokens
-	// into chunks of at most maxWords each; return the slice of chunk strings.
-	//
-	// Hint: strings.FieldsFunc(text, unicode.IsSpace) gives you the words.
-	_ = unicode.IsSpace // hint import
-	_ = strings.FieldsFunc
-	return nil
+	words := strings.FieldsFunc(text, unicode.IsSpace)
+	var chunks []string
+	for i := 0; i < len(words); i += maxWords {
+		end := i + maxWords
+		if end > len(words) {
+			end = len(words)
+		}
+		chunks = append(chunks, strings.Join(words[i:end], " "))
+	}
+	return chunks
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -97,10 +102,24 @@ func run(corpusPath, brokerAddr string, chunkSize int) error {
 		}
 		articleCount++
 
-		// TODO (Stage 1): call chunkText(art.Text, chunkSize) to get chunks.
-		// For each chunk i, build a taskPayload{DocID: art.ID, ChunkID: art.ID+"-"+strconv.Itoa(i), ...}
-		// Marshal to JSON and call client.Submit.  Append the returned task_id to taskIDs.
-		_ = art
+		for i, passage := range chunkText(art.Text, chunkSize) {
+			p := taskPayload{
+				DocID:   art.ID,
+				ChunkID: art.ID + "-" + strconv.Itoa(i),
+				Title:   art.Title,
+				Text:    passage,
+			}
+			payloadBytes, err := json.Marshal(p)
+			if err != nil {
+				return fmt.Errorf("marshal payload: %w", err)
+			}
+			resp, err := client.Submit(ctx, &pb.SubmitRequest{Payload: string(payloadBytes)})
+			if err != nil {
+				return fmt.Errorf("submit task: %w", err)
+			}
+			taskIDs = append(taskIDs, resp.TaskId)
+			chunkCount++
+		}
 	}
 
 	log.Printf("submitted %d chunks from %d articles — waiting for completion...", chunkCount, articleCount)
@@ -114,9 +133,24 @@ func run(corpusPath, brokerAddr string, chunkSize int) error {
 		pending[id] = true
 	}
 
-	// TODO (Stage 1): inside the loop, call client.GetResult for each pending ID;
-	// if done, remove from pending. When pending is empty, all tasks are done.
-	_ = pending
+	for len(pending) > 0 {
+		for id := range pending {
+			resp, err := client.GetResult(ctx, &pb.GetResultRequest{TaskId: id})
+			if err != nil {
+				log.Printf("GetResult %s: %v", id, err)
+				continue
+			}
+			if resp.Done {
+				if resp.Error != "" {
+					log.Printf("task %s failed: %s", id, resp.Error)
+				}
+				delete(pending, id)
+			}
+		}
+		if len(pending) > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 
 	fmt.Printf("indexed %d chunks from %d articles\n", chunkCount, articleCount)
 	return nil
