@@ -56,9 +56,9 @@ subprocess crashes mid-task? How does your implementation handle this?
 
 **Your answer:**
 
-Keeping one subprocess alive for the worker's lifetime amortizes the model load cost over every task. Loading `all-MiniLM-L6-v2` requires downloading and deserializing ~90MB of weights plus initializing the PyTorch runtime - this takes several seconds on first start. Paying that cost once per worker rather than once per task is the difference between ~2s/task overhead and ~2ms/task overhead, which is decisive at thousands of tasks.
+Keeping one subprocess alive for the worker's lifetime saves time. Loading `all-MiniLM-L6-v2` requires downloading and deserializing ~90MB of weights plus initializing the PyTorch runtime - this takes several seconds on first start. If the model had do be loaded once per task, the time to run a task would increase, and the system would work slower overall.
 
-The cost is reduced fault isolation: the subprocess holds the model in memory for the worker's entire lifetime. If it leaks memory or corrupts its internal state, the worker must be restarted to recover. A per-task subprocess would self-heal on every invocation but is impractically slow.
+This speed comes at a cost of reduced fault isolation. The subprocess holds the model in memory for the worker's entire lifetime. If it leaks memory or corrupts its internal state, the worker must be restarted to recover. A per-task subprocess would self-heal on every invocation but is impractically slow.
 
 If the subprocess crashes mid-task, `e.stdout.Scan()` returns `false` with `e.stdout.Err() == nil` (subprocess closed stdout), and `embed` returns `"subprocess closed stdout unexpectedly"`. The worker logs the error, calls `Complete` with the error string, and returns from `run()`, causing the process to exit. In Stage 2, if the worker crashes hard enough to skip the `Complete` call, the broker's `reEnqueueStalled` goroutine detects the missing heartbeat after `TaskTimeout = 10s` and moves the task back to `pending` for a healthy worker to pick up.
 
@@ -75,7 +75,7 @@ to the task? Is the resulting duplicate upsert a problem?
 
 The broker and Qdrant maintain independent state with no distributed transaction between them. A task can be `done=true` in the broker but absent from Qdrant (if the upsert failed before `Complete`), or present in Qdrant but still `inflight` in the broker (if `Complete` was never called). The producer has no way to verify which chunks actually landed in Qdrant - it only knows whether the broker acknowledged completion.
 
-Concrete failure scenario: Worker W polls task T for chunk `doc42-3`. W computes the embedding, calls `Upsert` on Qdrant successfully, and then its process is killed by the OS (OOM, `kill -9`, or hardware failure) before it can call `Complete`. From the broker's perspective, T is still inflight. In Stage 2, after `TaskTimeout = 10s` of missing heartbeats, `reEnqueueStalled` moves T back to `pending`. Worker W2 eventually polls T, re-embeds the same text (same model, deterministic output), and calls `Upsert` again with the same point ID (`chunkIDToUUID("doc42-3")` is deterministic). Qdrant's upsert is a blind overwrite by point ID - the second write lands with the same vector and payload as the first. W2 then calls `Complete` successfully.
+Consider a scenario: Worker W polls task T for chunk `doc42-3`. W computes the embedding, calls `Upsert` on Qdrant successfully, and then its process is killed by the OS before it can call `Complete`. From the broker's perspective, T is still inflight. In Stage 2, after `TaskTimeout = 10s` of missing heartbeats, `reEnqueueStalled` moves T back to `pending`. Worker W2 eventually polls T, re-embeds the same text (same model, deterministic output), and calls `Upsert` again with the same point ID (`chunkIDToUUID("doc42-3")` is deterministic). Qdrant's upsert is a blind overwrite by point ID - the second write lands with the same vector and payload as the first. W2 then calls `Complete` successfully.
 
 The duplicate upsert is not a correctness problem precisely because `chunkIDToUUID` is deterministic: the same chunk always maps to the same numeric point ID, and the embedding model always produces the same vector for the same text. Qdrant's upsert semantics overwrite the existing point with identical data. The final state of the collection is the same as if the task had run exactly once.
 
@@ -89,9 +89,9 @@ seen this pattern in HW3.)
 
 **Your answer:**
 
-All state - `s.pending`, `s.inflight`, `s.done`, and `s.errors` - lives only in process memory. If the broker crashes, every task in all three states is lost instantly. The producer holds a list of task IDs it submitted and is polling, but those IDs are now orphaned: `GetResult` will return `done=false` forever (the broker has no record of them after restart). The producer would block indefinitely waiting for tasks that will never complete.
+All state - `s.pending`, `s.inflight`, `s.done`, and `s.errors` - live only in process memory. If the broker crashes, every task in all three states is lost. The producer holds a list of task IDs it submitted and is polling, but those IDs are now orphaned: `GetResult` will return `done=false` forever (the broker has no record of them after restart). The producer would block indefinitely waiting for tasks that will never complete.
 
-To make the broker crash-tolerant I would add a write-ahead log (WAL) on disk - the same pattern used in HW3's Raft implementation. Before returning from any state-mutating RPC (`Submit`, `Poll`, `Complete`), the broker would append the operation and its arguments to a durable log file and call `fsync`. On startup, the broker would replay the log to reconstruct `pending`, `inflight`, `done`, and `errors` before accepting new RPCs. A `Submit` entry adds a task to `pending`; a `Poll` entry moves it to `inflight`; a `Complete` entry moves it to `done`. This guarantees that any operation acknowledged to the caller has been durably recorded and will survive a crash and restart.
+To make the broker crash-tolerant I would add a write-ahead log (WAL) on disk. Before returning from any state-mutating RPC (`Submit`, `Poll`, `Complete`), the broker would append the operation and its arguments to a durable log file and call `fsync`. On startup, the broker would replay the log to reconstruct `pending`, `inflight`, `done`, and `errors` before accepting new RPCs. A `Submit` entry adds a task to `pending`; a `Poll` entry moves it to `inflight`; a `Complete` entry moves it to `done`. This guarantees that any operation acknowledged to the caller has been durably recorded and will survive a crash and restart.
 
 ---
 
@@ -105,11 +105,13 @@ is too short? Too long? How would you tune it for a production pipeline?
 
 10s is reasonable for a development setup - it gives 50–200× headroom over the typical 50–200ms embedding time, which absorbs GC pauses, brief CPU saturation, and slow Qdrant writes without false re-enqueues. The heartbeat interval is 3s, so a healthy worker sends 3 heartbeats within the 10s window; it would need to miss all three consecutive heartbeats before being considered stalled.
 
-A timeout that is too short causes false re-enqueues on healthy but momentarily slow workers: the broker moves the task back to `pending` while the original worker is still processing it, so two workers embed the same chunk simultaneously. This wastes CPU and triggers unnecessary duplicate Qdrant upserts. Worse, under sustained CPU pressure every worker looks slow, and the broker thrashes - re-enqueueing tasks faster than workers can complete them.
+A timeout that is too short causes false re-enqueues on healthy but momentarily slow workers: the broker moves the task back to `pending` while the original worker is still processing it, so two workers embed the same chunk simultaneously. This wastes CPU and triggers unnecessary duplicate Qdrant upserts.
 
 A timeout that is too long means a crashed worker's tasks sit in `inflight` for a long time before a healthy worker can pick them up, increasing tail latency for the overall pipeline. With 10s and a 6,000-chunk corpus, a single crashed worker could stall its last 1–2 in-flight tasks for up to 10s, which is acceptable.
 
-In production I would set `TaskTimeout` to the P99 task duration multiplied by a safety factor of 3–5× - enough to absorb legitimate slowness without masking actual failures. Concretely: collect a histogram of task durations from a representative run, find P99, and set the timeout to `P99 * 4`. The heartbeat interval should be roughly `TaskTimeout / 4` so a healthy worker sends at least three heartbeats before the deadline.
+In production I would set `TaskTimeout` to the P99 task duration multiplied by a factor of 4. It should ve enough to absorb legitimate slowness without masking actual failures.
+
+To be more specific: I would collect a histogram of task durations from a representative run, find P99, and set the timeout to `P99 * 4`. The heartbeat interval should be roughly `TaskTimeout / 4` so a healthy worker sends at least three heartbeats before the deadline.
 
 ---
 
@@ -124,7 +126,7 @@ problem? What additional mechanism would you need for **exactly-once** delivery?
 
 **Your answer:**
 
-Concrete trace: Worker W1 polls task T (`chunk_id = "doc7-2"`). W1 starts embedding but enters a long GC pause - it does not call `Heartbeat` for 11 seconds. The broker's `reEnqueueStalled` goroutine fires, notices `time.Since(e.lastHeartbeat) > 10s`, removes T from `inflight`, and prepends it back to `pending`. Worker W2 polls T, embeds the chunk, upserts the vector to Qdrant, and calls `Complete` - T is now `done=true`. Meanwhile W1 wakes from its GC pause, finishes embedding the same text, and calls `Upsert` on Qdrant again. W1 then calls `Complete(T)` - the broker treats it as a no-op since T is already in `s.done`. The chunk has been embedded twice.
+Example execution trace: Worker W1 polls task T (`chunk_id = "doc7-2"`). W1 starts embedding but enters a long GC pause - it does not call `Heartbeat` for 11 seconds. The broker's `reEnqueueStalled` goroutine fires, notices `time.Since(e.lastHeartbeat) > 10s`, removes T from `inflight`, and prepends it back to `pending`. Worker W2 polls T, embeds the chunk, upserts the vector to Qdrant, and calls `Complete` - T is now `done=true`. Meanwhile W1 wakes from its GC pause, finishes embedding the same text, and calls `Upsert` on Qdrant again. W1 then calls `Complete(T)` - the broker treats it as a no-op since T is already in `s.done`. The chunk has been embedded twice.
 
 This is not a correctness problem. `chunkIDToUUID` is deterministic (FNV-64 of the chunk ID), and `all-MiniLM-L6-v2` is deterministic for the same input text. Both upserts write the same point ID with the same 384-dimensional vector and the same payload. The second upsert is a no-op from Qdrant's perspective - the collection state after two executions is identical to what it would be after one.
 
@@ -140,9 +142,9 @@ tasks makes re-execution safe (hint: think about determinism and side effects)?
 
 **Your answer:**
 
-Re-execution is safe here because embedding is a pure function: given the same input text and the same model weights, `all-MiniLM-L6-v2` always produces the same 384-dimensional vector. The task has no shared mutable side effects - the only write is a Qdrant upsert keyed by a deterministic point ID, and that upsert is idempotent. Executing the same task ten times produces exactly the same database state as executing it once. This is the same property MapReduce relies on: map and reduce tasks are pure functions, so a failed task can simply be re-run on a different worker.
+Re-execution is safe here because embedding is a pure function: given the same input text and the same model weights, `all-MiniLM-L6-v2` always produces the same 384-dimensional vector. The task has no shared mutable side effects. The only write is a Qdrant upsert keyed by a deterministic point ID, and that upsert is idempotent. Executing the same task ten times produces exactly the same database state as executing it once.
 
-A KV store Put("x", "v") is not a pure function in the same sense. The meaningful observable effect is "x transitions to v in a linearizable global state that clients will read." If a Put is applied twice - say because both the original leader and a newly elected leader replay the operation - the second application overwrites a value that may have been changed by a subsequent Put from a different client in between. Re-execution would violate linearizability. Raft solves this by ensuring each log entry is applied exactly once in a globally agreed order: the log is the mechanism that prevents the same command from being committed more than once, even under failures. There is no equivalent log-ordering requirement for embedding tasks because the idempotent upsert absorbs duplicates without visible effect.
+A KV store Put("x", "v") is not a pure function in the same sense. If a Put is applied twice - say because both the original leader and a newly elected leader replay the operation - the second application overwrites a value that may have been changed by a subsequent Put from a different client in between. Re-execution would violate linearizability. Raft solves this by ensuring each log entry is applied exactly once in a globally agreed order: the log is the mechanism that prevents the same command from being committed more than once, even under failures. There is no equivalent log-ordering requirement for embedding tasks because the idempotent upsert absorbs duplicates without visible effect.
 
 ---
 
