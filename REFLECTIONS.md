@@ -21,8 +21,8 @@ Record your wall-clock times here after running the corpus index with 1 and 4 wo
 
 | Workers | Time to index corpus (s) | Notes |
 |---------|--------------------------|-------|
-| 1       |                          |       |
-| 4       |                          |       |
+| 1       | 8.8                      | Real sentence-transformers embedder; model pre-loaded (~490 MiB RSS) |
+| 4       | 10.1                     | 4 × ~490 MiB = ~1.96 GB RSS; 4 workers slower than 1 due to CPU |
 
 ---
 
@@ -172,13 +172,13 @@ startup, Qdrant write throughput, or network? How did you determine this?
 
 **Your answer:**
 
-*(Times to be filled in after running the Stage 3 Docker Compose experiment.)*
+The speedup from 1 → 4 workers was negative. 1 worker indexed the corpus in 8.8s; 4 workers took 10.1s, (x0.87). Adding workers made throughput worse.
 
-I expect the speedup to be sub-linear - roughly 2–3× with 4 workers rather than 4×. On a single physical machine, all four worker containers and the Python subprocesses compete for the same CPU cores during inference. `all-MiniLM-L6-v2` is CPU-bound; four concurrent embedding calls contend for cores rather than executing in parallel on separate hardware. This is the same reason the background section notes "on a single machine, workers compete for CPU cores during inference rather than parallelizing."
+The bottleneck is CPU contention during model inference, compounded by memory pressure. Each worker container loads `all-MiniLM-L6-v2` into its Python subprocess, consuming ~490 MiB RSS. Four workers bring the total to ~1.96 GB of model memory competing with Qdrant (~200 MiB) and the OS. 
 
-The most likely bottleneck is CPU saturation during model inference, not the broker or Qdrant. Evidence: the broker's critical section is tiny (append to a slice or delete from a map), so lock contention at 4 workers is negligible. Qdrant writes are fast for 384-dim vectors. Subprocess startup is a one-time cost at worker initialization, not per-task.
+Here is my explanation: When available physical memory is exhausted, the kernel starts paging. The result is that each individual worker's per-task latency increases faster than the parallelism can compensate.
 
-To determine the actual bottleneck I would: (1) run `top` or `htop` while the pipeline is active - if all cores are pinned at 100%, inference is the limit; (2) compare the per-task latency reported in worker logs at 1 vs. 4 workers - if per-task time grows proportionally with N workers, it confirms CPU sharing, not broker contention; (3) add a broker-side counter of concurrent inflight tasks to confirm the mutex is never held long enough to matter.
+The broker and Qdrant are not the bottleneck. The broker's critical section is a slice append or map delete. Lock contention at 4 workers is unmeasurable. Qdrant upserts for 384-dim vectors should be fast. True linear scaling would require 4 separate physical machines with isolated CPU and memory, not 4 containers on one host.
 
 ---
 
