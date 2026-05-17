@@ -1,11 +1,25 @@
-# TODO (Stage 3): Complete this docker-compose.yml.
-#
-# Requirements:
-#   - broker service: builds from Dockerfile.broker, exposes port 9000
-#   - qdrant service: uses the official qdrant/qdrant image, exposes port 6333 (HTTP)
-#                     and port 6334 (gRPC)
-#   - worker service: builds from Dockerfile.worker; reads BROKER_ADDR, QDRANT_ADDR,
-#                     and EMBEDDER_CMD from environment; depends on broker and qdrant
-#
-# Workers must reference other services by container name, not by IP address.
-# Test scaling with: docker compose up --scale worker=4 -d
+services:
+  broker:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    ports:
+      - "9000:9000"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - BROKER_ADDR=broker:9000
+      - QDRANT_ADDR=qdrant:6334
+      - EMBEDDER_CMD=python3 /app/embedder.py
+    depends_on:
+      - broker
+      - qdrant

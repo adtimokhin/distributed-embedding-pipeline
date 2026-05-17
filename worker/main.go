@@ -230,13 +230,30 @@ func run(brokerAddr, qdrantAddr, embedderCmd string) error {
 		}
 		task := pollResp.Task
 
-		// TODO (Stage 2): start a background heartbeat goroutine that calls
-		// brokerClient.Heartbeat(workerID, task.Id) every HeartbeatInterval.
-		// Cancel it (via context or channel) after Complete/error.
+		// Heartbeat goroutine: runs for the lifetime of this task.
+		hbCtx, cancelHB := context.WithCancel(context.Background())
+		go func() {
+			ticker := time.NewTicker(HeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hbCtx.Done():
+					return
+				case <-ticker.C:
+					if _, err := brokerClient.Heartbeat(hbCtx, &pb.HeartbeatRequest{
+						WorkerId: workerID,
+						TaskId:   task.Id,
+					}); err != nil && hbCtx.Err() == nil {
+						log.Printf("heartbeat task %s: %v", task.Id, err)
+					}
+				}
+			}
+		}()
 
 		var p taskPayload
 		if err := json.Unmarshal([]byte(task.Payload), &p); err != nil {
 			log.Printf("decode task %s: %v", task.Id, err)
+			cancelHB()
 			brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: err.Error()}) //nolint:errcheck
 			return fmt.Errorf("decode task payload: %w", err)
 		}
@@ -244,16 +261,19 @@ func run(brokerAddr, qdrantAddr, embedderCmd string) error {
 		embedResp, err := emb.embed(embedRequest{ChunkID: p.ChunkID, Text: p.Text})
 		if err != nil {
 			log.Printf("embed task %s: %v", task.Id, err)
+			cancelHB()
 			brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: err.Error()}) //nolint:errcheck
 			return fmt.Errorf("embed task: %w", err)
 		}
 
 		if err := upsertVector(ctx, qdrantClient, p, embedResp.Vector); err != nil {
 			log.Printf("upsert task %s: %v", task.Id, err)
+			cancelHB()
 			brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: err.Error()}) //nolint:errcheck
 			return fmt.Errorf("upsert task: %w", err)
 		}
 
+		cancelHB()
 		if _, err := brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: ""}); err != nil {
 			log.Printf("complete task %s: %v", task.Id, err)
 		}

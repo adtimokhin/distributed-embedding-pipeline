@@ -1,10 +1,17 @@
-# TODO (Stage 3): Complete this Dockerfile.
-#
-# The worker image must contain TWO things:
-#   1. The compiled Go worker binary
-#   2. The Python embedder and its dependencies (sentence-transformers)
-#
-# Use a multi-stage build:
-#   Stage 1 ("builder"): golang:1.24-alpine — compile the Go worker binary.
-#   Stage 2 (runtime):   python:3.11-slim   — install Python deps, copy binary.
-#
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o /worker ./worker
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY tools/embedder/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY tools/embedder/embedder.py .
+COPY --from=builder /worker /worker
+ENV BROKER_ADDR=broker:9000
+ENV QDRANT_ADDR=qdrant:6334
+ENV EMBEDDER_CMD="python3 /app/embedder.py"
+ENTRYPOINT ["/bin/sh", "-c", "exec /worker --broker=${BROKER_ADDR} --qdrant=${QDRANT_ADDR} --embedder=\"${EMBEDDER_CMD}\""]

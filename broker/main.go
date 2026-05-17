@@ -130,17 +130,32 @@ func (s *brokerServer) GetResult(_ context.Context, req *pb.GetResultRequest) (*
 // Heartbeat updates the last-seen timestamp for an in-flight task so the broker
 // knows the worker is still alive.
 func (s *brokerServer) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	// TODO (Stage 2): find inflight[req.TaskId] and update lastHeartbeat.
-	// Stage 1 stub: just return ok.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if e, ok := s.inflight[req.TaskId]; ok {
+		e.lastHeartbeat = time.Now()
+	}
 	return &pb.HeartbeatResponse{Ok: true}, nil
 }
 
 // reEnqueueStalled is the background goroutine that scans inflight tasks and
 // moves any that have not sent a heartbeat within TaskTimeout back to pending.
 func (s *brokerServer) reEnqueueStalled() {
-	// TODO (Stage 2): ticker loop; on each tick, lock and scan s.inflight.
-	// For entries where time.Since(e.lastHeartbeat) > TaskTimeout, delete from
-	// inflight and prepend to pending (so they are picked up promptly).
+	ticker := time.NewTicker(CheckInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.Lock()
+		for id, e := range s.inflight {
+			if time.Since(e.lastHeartbeat) > TaskTimeout {
+				log.Printf("re-enqueuing stalled task %s (worker %s, silent for %s)",
+					id, e.workerID, time.Since(e.lastHeartbeat).Round(time.Second))
+				s.pending = append([]*pb.Task{e.task}, s.pending...)
+				delete(s.inflight, id)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -159,8 +174,7 @@ func main() {
 	srv := grpc.NewServer()
 	bs := newBrokerServer()
 
-	// Stage 2: uncomment to start the re-enqueue background goroutine.
-	// go bs.reEnqueueStalled()
+	go bs.reEnqueueStalled()
 
 	pb.RegisterBrokerServer(srv, bs)
 	log.Printf("broker listening on :%d", *port)
