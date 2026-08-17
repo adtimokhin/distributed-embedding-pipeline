@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // Request/Response mirror the embedder subprocess's line-delimited JSON
@@ -26,7 +27,11 @@ type Response struct {
 
 // Embedder drives one embedding subprocess for its entire lifetime — spawned
 // once via Start, reused for every subsequent Embed call, torn down by Close.
+// Safe for concurrent use: Embed serializes access to the subprocess's
+// stdin/stdout so concurrent callers (e.g. an HTTP server handling several
+// requests at once) can't interleave requests and responses.
 type Embedder struct {
+	mu     sync.Mutex
 	cmd    *exec.Cmd
 	stdin  *bufio.Writer
 	stdout *bufio.Scanner
@@ -61,6 +66,9 @@ func Start(cmdStr string) (*Embedder, error) {
 
 // Embed sends one request line and reads one response line.
 func (e *Embedder) Embed(req Request) (Response, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	line, err := json.Marshal(req)
 	if err != nil {
 		return Response{}, fmt.Errorf("marshal request: %w", err)

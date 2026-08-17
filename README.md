@@ -10,6 +10,7 @@ A distributed pipeline that chunks Wikipedia articles, fans the chunks out to a 
 | **Worker** (`worker/`) | Polls the broker (via `internal/brokerclient`, which follows leader redirects), drives a long-lived embedder subprocess, writes vectors directly to Qdrant. |
 | **Producer** (`producer/`) | Reads the corpus, chunks articles to ≤200 words, submits tasks, polls for completion. |
 | **Query CLI** (`query/`) | Embeds a query string, runs kNN search against Qdrant, prints top-k results. |
+| **Query server** (`queryserver/`) | HTTP retrieval API — `POST /search {"query", "top_k"}` → JSON results — for calling into the index from an agent/RAG system instead of a CLI. Same embed+search logic as the CLI (`internal/retrieval`), served from a long-lived process instead of a one-shot invocation. |
 
 ## Quick start
 
@@ -30,6 +31,19 @@ go run ./query "Byzantine fault tolerance" --qdrant=localhost:6334 --embedder="p
 ```
 
 `--broker` on the worker/producer takes any subset of the cluster's client addresses, in any order — it doesn't need to be the current leader. `internal/brokerclient` finds the leader by trying each address and following `redirect_addr` responses.
+
+### Retrieval API
+
+```bash
+go run ./queryserver --addr=:8080 --qdrant=localhost:6334 --embedder=/tmp/mock_embedder
+
+curl -X POST localhost:8080/search -d '{"query": "Byzantine fault tolerance", "top_k": 5}'
+# [{"doc_id": "...", "title": "...", "text": "...", "score": 0.83}, ...]
+
+curl localhost:8080/healthz
+```
+
+The embedder subprocess and Qdrant connection are established once at startup and held for the server's lifetime — unlike the CLI, which is a one-shot process, this is what actually makes "don't reload the model per query" observable. `Embed` is mutex-guarded so concurrent requests can't interleave on the subprocess's stdin/stdout.
 
 ### Docker Compose (Stage 3)
 
@@ -58,6 +72,8 @@ One worker-lifetime subprocess speaks line-delimited JSON on stdin/stdout:
 - **`*pb.Task` everywhere, not `pb.Task`.** Protobuf-generated structs embed `protoimpl.MessageState`, which contains a `sync.Mutex` — storing them by value triggers `go vet`'s "assignment copies lock value." Both the broker's internal maps and `inFlightEntry` had to switch to pointers.
 - **`cancelHB()` is called before `Complete`, not after**, in the worker. Calling it after leaves a window where a heartbeat can fire for a task the broker has already marked done — harmless here (the lookup is a no-op) but the ordering removes the race entirely rather than relying on it being benign.
 - **The broker is a 3-node Raft-replicated cluster (extension), not a single in-memory process.** `Submit` and `Complete` are proposed as Raft log entries and block until committed to a majority — these are the two facts that must survive a crash ("this task exists," "this task is done"), since losing either drops work forever or leaves the producer polling `GetResult` on an orphaned ID forever. `Poll`'s task→worker assignment and `Heartbeat`'s liveness tracking are deliberately *not* replicated: they're leader-local, ephemeral scheduling state. If the leader crashes, in-flight assignments are simply forgotten and the new leader treats every submitted-but-not-done task as available again — safe for exactly the same reason re-execution is already safe within a single broker (see the at-least-once bullet above). This keeps Poll/Heartbeat cheap (no consensus round trip on a 100ms poll loop) and means "pending" is a derived view rather than stored state: scan submitted tasks in commit order, skip anything done or currently in-flight. `worker`/`producer` no longer dial a fixed broker address — `internal/brokerclient` takes a list of cluster addresses and follows `redirect_addr` responses (or, if a redirect names an address the caller can't itself resolve — e.g. a Docker-internal hostname reported to a host-invoked producer — falls back to round-robining its own known address list) to find the current leader.
+- **The embedder subprocess is a shared, reusable component (`internal/embedder`), not duplicated per binary.** `worker/main.go` originally had its own private spawn-once-reuse-for-lifetime subprocess type; `query/main.go` originally spawned and killed a fresh subprocess *per query*, which is fine for an infrequent CLI call but pays model-load latency on every call — unusable for something an agent calls repeatedly. Both now share one `Embedder` type. Making it shared also surfaced a real bug before it shipped: the original type had no concurrency guard, which was harmless when only one goroutine ever called `embed` (the worker's sequential poll loop) but would silently interleave requests/responses once `queryserver` started calling it from multiple HTTP handler goroutines at once. `Embed` now holds a mutex for the full request/response round trip.
+- **Retrieval is exposed as `queryserver`'s HTTP API, not just the `query` CLI.** Both share `internal/retrieval`'s embed-then-search logic; the CLI is a thin one-shot wrapper around it, `queryserver` holds the embedder and Qdrant connection open across requests. This is the actual point at which the index becomes something a RAG agent can call synchronously, rather than something you inspect by hand.
 
 ## Scaling result (Stage 3, 1 vs. 4 workers)
 
@@ -79,8 +95,11 @@ hw4/
 ├── broker/main.go              ← implementation (Raft-replicated state machine + gRPC wiring)
 ├── worker/main.go              ← implementation
 ├── producer/main.go            ← implementation
-├── query/main.go               ← implementation
+├── query/main.go               ← implementation — one-shot CLI, thin wrapper around internal/retrieval
+├── queryserver/main.go         ← implementation — HTTP retrieval API, long-lived, same internal/retrieval logic
 ├── internal/brokerclient/      ← implementation — shared leader-discovery/redirect client (worker + producer)
+├── internal/embedder/          ← implementation — shared long-lived embedder subprocess (worker, query, queryserver)
+├── internal/retrieval/         ← implementation — shared embed+kNN-search logic (query, queryserver)
 ├── raft/, config/, internal/log/ ← copied from HW3 (own module, so vendored not imported); raft.go unmodified
 ├── broker_nodeconfig.json      ← implementation — local 3-node cluster addresses
 ├── broker_nodeconfig-docker.json ← implementation — Docker Compose cluster addresses
