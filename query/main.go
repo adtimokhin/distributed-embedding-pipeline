@@ -100,26 +100,38 @@ func run(queryText, qdrantAddr, embedderCmd string, topK int) error {
 	pointsClient := qdrant.NewPointsClient(conn)
 
 	// ── kNN search ───────────────────────────────────────────────────────────
-	// TODO: call pointsClient.Search with the query vector and return the top-K results.
-	// Print each result as: [rank] title — text[:200]...
-	//
-	// Hint: use qdrant.SearchPoints with:
-	//   CollectionName: QdrantCollection
-	//   Vector:         vector (as []float32)
-	//   Limit:          uint64(topK)
-	//   WithPayload:    &qdrant.WithPayloadSelector{SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: true}}
 	ctx := context.Background()
-	_ = ctx
-	_ = pointsClient
-	_ = vector
+	resp, err := pointsClient.Search(ctx, &qdrant.SearchPoints{
+		CollectionName: QdrantCollection,
+		Vector:         vector,
+		Limit:          uint64(topK),
+		WithPayload:    &qdrant.WithPayloadSelector{SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: true}},
+	})
+	if err != nil {
+		return fmt.Errorf("qdrant search: %w", err)
+	}
 
-	return fmt.Errorf("query search: not implemented")
+	if len(resp.Result) == 0 {
+		fmt.Println("no results")
+		return nil
+	}
+
+	for i, point := range resp.Result {
+		title := point.Payload["title"].GetStringValue()
+		text := point.Payload["text"].GetStringValue()
+		if len(text) > 200 {
+			text = text[:200] + "..."
+		}
+		fmt.Printf("[%d] %s (score=%.4f) — %s\n", i+1, title, point.Score, text)
+	}
+
+	return nil
 }
 
 func main() {
-	qdrantAddr  := flag.String("qdrant",   "localhost:6334", "qdrant gRPC address (port 6334)")
+	qdrantAddr := flag.String("qdrant", "localhost:6334", "qdrant gRPC address (port 6334)")
 	embedderCmd := flag.String("embedder", "python3 tools/embedder/embedder.py", "embedding subprocess command")
-	topK        := flag.Int("top",         5,                "number of results to return")
+	topK := flag.Int("top", 5, "number of results to return")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
