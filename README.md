@@ -1,13 +1,13 @@
 # HW4 — Distributed Document Embedding Pipeline
 
-A distributed pipeline that chunks Wikipedia articles, fans the chunks out to a pool of workers for vector embedding, and stores the results in Qdrant for kNN search. Stages 1–3 (core pipeline, at-least-once delivery, containerized deployment) are complete; the persistent-broker-WAL extension is not.
+A distributed pipeline that chunks Wikipedia articles, fans the chunks out to a pool of workers for vector embedding, and stores the results in Qdrant for kNN search. Stages 1–3 (core pipeline, at-least-once delivery, containerized deployment) are complete. The broker is a Raft-replicated 3-node cluster (extension, reusing HW3's `raft` package) rather than a single in-memory process — see "Raft-replicated broker" below.
 
 ## Components
 
 | Component | Role |
 |-----------|------|
-| **Broker** (`broker/`) | gRPC task queue: `Submit`, `Poll`, `Complete`, `GetResult`, `Heartbeat`. Tracks `pending` / `inflight` / `done` / `errors`. |
-| **Worker** (`worker/`) | Polls the broker, drives a long-lived embedder subprocess, writes vectors directly to Qdrant. |
+| **Broker** (`broker/`) | 3-node Raft-replicated task queue: `Submit`, `Poll`, `Complete`, `GetResult`, `Heartbeat` on the client-facing service; `RequestVote`/`AppendEntries`/`InstallSnapshot` on the peer-facing Raft service. |
+| **Worker** (`worker/`) | Polls the broker (via `internal/brokerclient`, which follows leader redirects), drives a long-lived embedder subprocess, writes vectors directly to Qdrant. |
 | **Producer** (`producer/`) | Reads the corpus, chunks articles to ≤200 words, submits tasks, polls for completion. |
 | **Query CLI** (`query/`) | Embeds a query string, runs kNN search against Qdrant, prints top-k results. |
 
@@ -19,19 +19,23 @@ go build -o /tmp/mock_embedder ./tools/mock_embedder   # deterministic embedder,
 docker run -d -p 6333:6333 -p 6334:6334 qdrant/qdrant:latest
 ```
 
-4 terminals, from `hw4/`:
+6 terminals, from `hw4/` (3 broker replicas + worker + producer + query):
 ```bash
-go run ./broker --port=9000
-go run ./worker --broker=localhost:9000 --qdrant=localhost:6334 --embedder=/tmp/mock_embedder
-go run ./producer --corpus=corpus/wiki.jsonl.gz --broker=localhost:9000
+go run ./broker --id=0 --config=broker_nodeconfig.json
+go run ./broker --id=1 --config=broker_nodeconfig.json
+go run ./broker --id=2 --config=broker_nodeconfig.json
+go run ./worker --broker=localhost:9000,localhost:9001,localhost:9002 --qdrant=localhost:6334 --embedder=/tmp/mock_embedder
+go run ./producer --corpus=corpus/wiki.jsonl.gz --broker=localhost:9000,localhost:9001,localhost:9002
 go run ./query "Byzantine fault tolerance" --qdrant=localhost:6334 --embedder="python3 tools/embedder/embedder.py" --top=5
 ```
+
+`--broker` on the worker/producer takes any subset of the cluster's client addresses, in any order — it doesn't need to be the current leader. `internal/brokerclient` finds the leader by trying each address and following `redirect_addr` responses.
 
 ### Docker Compose (Stage 3)
 
 ```bash
 docker compose up --build --scale worker=1 -d
-go run ./producer --corpus=corpus/wiki.jsonl.gz --broker=localhost:9000
+go run ./producer --corpus=corpus/wiki.jsonl.gz --broker=localhost:9000,localhost:9001,localhost:9002
 go run ./query "distributed consensus" --qdrant=localhost:6334 --embedder="python3 tools/embedder/embedder.py" --top=5
 docker compose up --scale worker=4 -d   # scale workers
 docker compose down
@@ -53,7 +57,7 @@ One worker-lifetime subprocess speaks line-delimited JSON on stdin/stdout:
 - **Workers write to Qdrant directly; the broker never sees the vectors.** This means broker state (`done`) and Qdrant state can diverge after a crash between the upsert and the `Complete` call — not a correctness problem here only because the upsert is idempotent, but it does mean the broker's bookkeeping isn't a source of truth for what's actually indexed.
 - **`*pb.Task` everywhere, not `pb.Task`.** Protobuf-generated structs embed `protoimpl.MessageState`, which contains a `sync.Mutex` — storing them by value triggers `go vet`'s "assignment copies lock value." Both the broker's internal maps and `inFlightEntry` had to switch to pointers.
 - **`cancelHB()` is called before `Complete`, not after**, in the worker. Calling it after leaves a window where a heartbeat can fire for a task the broker has already marked done — harmless here (the lookup is a no-op) but the ordering removes the race entirely rather than relying on it being benign.
-- **The broker is purely in-memory and not crash-tolerant.** A broker restart loses every queued/inflight task with no recovery path; the producer would poll orphaned task IDs forever. Fixing this is the unimplemented extension — a WAL that durably logs `Submit`/`Poll`/`Complete` before acking, replayed on startup.
+- **The broker is a 3-node Raft-replicated cluster (extension), not a single in-memory process.** `Submit` and `Complete` are proposed as Raft log entries and block until committed to a majority — these are the two facts that must survive a crash ("this task exists," "this task is done"), since losing either drops work forever or leaves the producer polling `GetResult` on an orphaned ID forever. `Poll`'s task→worker assignment and `Heartbeat`'s liveness tracking are deliberately *not* replicated: they're leader-local, ephemeral scheduling state. If the leader crashes, in-flight assignments are simply forgotten and the new leader treats every submitted-but-not-done task as available again — safe for exactly the same reason re-execution is already safe within a single broker (see the at-least-once bullet above). This keeps Poll/Heartbeat cheap (no consensus round trip on a 100ms poll loop) and means "pending" is a derived view rather than stored state: scan submitted tasks in commit order, skip anything done or currently in-flight. `worker`/`producer` no longer dial a fixed broker address — `internal/brokerclient` takes a list of cluster addresses and follows `redirect_addr` responses (or, if a redirect names an address the caller can't itself resolve — e.g. a Docker-internal hostname reported to a host-invoked producer — falls back to round-robining its own known address list) to find the current leader.
 
 ## Scaling result (Stage 3, 1 vs. 4 workers)
 
@@ -72,13 +76,18 @@ Scaling was negative, not just sub-linear: 4 containers on one host compete for 
 
 ```
 hw4/
-├── broker/main.go          ← implementation
-├── worker/main.go          ← implementation
-├── producer/main.go        ← implementation
-├── query/main.go           ← implementation
-├── Dockerfile.worker       ← implementation (Stage 3)
-├── docker-compose.yml      ← implementation (Stage 3)
-├── proto/, corpus/, tools/ ← provided, unmodified
+├── broker/main.go              ← implementation (Raft-replicated state machine + gRPC wiring)
+├── worker/main.go              ← implementation
+├── producer/main.go            ← implementation
+├── query/main.go               ← implementation
+├── internal/brokerclient/      ← implementation — shared leader-discovery/redirect client (worker + producer)
+├── raft/, config/, internal/log/ ← copied from HW3 (own module, so vendored not imported); raft.go unmodified
+├── broker_nodeconfig.json      ← implementation — local 3-node cluster addresses
+├── broker_nodeconfig-docker.json ← implementation — Docker Compose cluster addresses
+├── Dockerfile.broker           ← implementation (Stage 3)
+├── Dockerfile.worker           ← implementation (Stage 3)
+├── docker-compose.yml          ← implementation (Stage 3) — broker0/broker1/broker2 + qdrant + worker
+├── proto/, corpus/, tools/     ← provided, unmodified (proto/raft.proto copied from HW3 alongside the provided broker.proto)
 └── REFLECTIONS.md
 ```
 

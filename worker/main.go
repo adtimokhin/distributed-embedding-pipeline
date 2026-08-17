@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	pb "pipeline/proto"
+	"pipeline/internal/brokerclient"
 
 	qdrant "github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
@@ -172,14 +172,9 @@ func upsertVector(ctx context.Context, client qdrant.PointsClient, p taskPayload
 // Main worker loop
 // ──────────────────────────────────────────────────────────────────────────────
 
-func run(brokerAddr, qdrantAddr, embedderCmd string) error {
-	// ── Connect to broker ────────────────────────────────────────────────────
-	brokerConn, err := grpc.NewClient(brokerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("dial broker: %w", err)
-	}
-	defer brokerConn.Close()
-	brokerClient := pb.NewBrokerClient(brokerConn)
+func run(brokerAddrs []string, qdrantAddr, embedderCmd string) error {
+	// ── Broker client (Raft cluster: follows redirects, retries across nodes) ─
+	brokerClient := brokerclient.New(brokerAddrs)
 
 	// ── Connect to Qdrant ────────────────────────────────────────────────────
 	qdrantConn, err := grpc.NewClient(qdrantAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -212,23 +207,22 @@ func run(brokerAddr, qdrantAddr, embedderCmd string) error {
 
 	// ── Worker ID ────────────────────────────────────────────────────────────
 	workerID := fmt.Sprintf("worker-%d", os.Getpid())
-	log.Printf("worker %s starting (broker=%s qdrant=%s)", workerID, brokerAddr, qdrantAddr)
+	log.Printf("worker %s starting (broker=%v qdrant=%s)", workerID, brokerAddrs, qdrantAddr)
 
 	// ── Poll loop ────────────────────────────────────────────────────────────
 	for {
 		ctx := context.Background()
 
-		pollResp, err := brokerClient.Poll(ctx, &pb.PollRequest{WorkerId: workerID})
+		task, hasTask, err := brokerClient.Poll(ctx, workerID)
 		if err != nil {
 			log.Printf("poll error: %v", err)
 			time.Sleep(PollInterval)
 			continue
 		}
-		if !pollResp.HasTask {
+		if !hasTask {
 			time.Sleep(PollInterval)
 			continue
 		}
-		task := pollResp.Task
 
 		// Heartbeat goroutine: runs for the lifetime of this task.
 		hbCtx, cancelHB := context.WithCancel(context.Background())
@@ -240,10 +234,7 @@ func run(brokerAddr, qdrantAddr, embedderCmd string) error {
 				case <-hbCtx.Done():
 					return
 				case <-ticker.C:
-					if _, err := brokerClient.Heartbeat(hbCtx, &pb.HeartbeatRequest{
-						WorkerId: workerID,
-						TaskId:   task.Id,
-					}); err != nil && hbCtx.Err() == nil {
+					if err := brokerClient.Heartbeat(hbCtx, workerID, task.Id); err != nil && hbCtx.Err() == nil {
 						log.Printf("heartbeat task %s: %v", task.Id, err)
 					}
 				}
@@ -254,7 +245,7 @@ func run(brokerAddr, qdrantAddr, embedderCmd string) error {
 		if err := json.Unmarshal([]byte(task.Payload), &p); err != nil {
 			log.Printf("decode task %s: %v", task.Id, err)
 			cancelHB()
-			brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: err.Error()}) //nolint:errcheck
+			brokerClient.Complete(ctx, task.Id, workerID, err.Error()) //nolint:errcheck
 			return fmt.Errorf("decode task payload: %w", err)
 		}
 
@@ -262,26 +253,26 @@ func run(brokerAddr, qdrantAddr, embedderCmd string) error {
 		if err != nil {
 			log.Printf("embed task %s: %v", task.Id, err)
 			cancelHB()
-			brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: err.Error()}) //nolint:errcheck
+			brokerClient.Complete(ctx, task.Id, workerID, err.Error()) //nolint:errcheck
 			return fmt.Errorf("embed task: %w", err)
 		}
 
 		if err := upsertVector(ctx, qdrantClient, p, embedResp.Vector); err != nil {
 			log.Printf("upsert task %s: %v", task.Id, err)
 			cancelHB()
-			brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: err.Error()}) //nolint:errcheck
+			brokerClient.Complete(ctx, task.Id, workerID, err.Error()) //nolint:errcheck
 			return fmt.Errorf("upsert task: %w", err)
 		}
 
 		cancelHB()
-		if _, err := brokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: task.Id, WorkerId: workerID, Error: ""}); err != nil {
+		if err := brokerClient.Complete(ctx, task.Id, workerID, ""); err != nil {
 			log.Printf("complete task %s: %v", task.Id, err)
 		}
 	}
 }
 
 func main() {
-	brokerAddr := flag.String("broker", "localhost:9000", "broker gRPC address")
+	brokerAddrs := flag.String("broker", "localhost:9000,localhost:9001,localhost:9002", "comma-separated broker gRPC addresses (client-facing)")
 	qdrantAddr := flag.String("qdrant", "localhost:6334", "qdrant gRPC address (port 6334)")
 	embedderCmd := flag.String("embedder", "", "embedding subprocess command (e.g. 'python3 tools/embedder/embedder.py')")
 	flag.Parse()
@@ -290,7 +281,7 @@ func main() {
 		log.Fatal("--embedder is required")
 	}
 
-	if err := run(*brokerAddr, *qdrantAddr, *embedderCmd); err != nil {
+	if err := run(strings.Split(*brokerAddrs, ","), *qdrantAddr, *embedderCmd); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -18,16 +18,16 @@ message Task {
 }
 
 message SubmitRequest  { string payload  = 1; }
-message SubmitResponse { string task_id  = 1; }
+message SubmitResponse { string task_id  = 1; bool ok = 2; string redirect_addr = 3; }
 
 message PollRequest    { string worker_id = 1; }
-message PollResponse   { Task task = 1; bool has_task = 2; }
+message PollResponse   { Task task = 1; bool has_task = 2; string redirect_addr = 3; }
 
 message CompleteRequest  { string task_id = 1; string worker_id = 2; string error = 3; }
-message CompleteResponse { bool ok = 1; }
+message CompleteResponse { bool ok = 1; string redirect_addr = 2; }
 
 message HeartbeatRequest  { string worker_id = 1; string task_id = 2; }
-message HeartbeatResponse { bool ok = 1; }
+message HeartbeatResponse { bool ok = 1; string redirect_addr = 2; }
 
 message GetResultRequest  { string task_id = 1; }
 message GetResultResponse { bool done = 1; string error = 2; }

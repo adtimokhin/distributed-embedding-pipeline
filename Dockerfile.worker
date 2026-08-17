@@ -11,7 +11,7 @@ COPY tools/embedder/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY tools/embedder/embedder.py .
 COPY --from=builder /worker /worker
-ENV BROKER_ADDR=broker:9000
+ENV BROKER_ADDR=broker0:9000,broker1:9000,broker2:9000
 ENV QDRANT_ADDR=qdrant:6334
 ENV EMBEDDER_CMD="python3 /app/embedder.py"
 ENTRYPOINT ["/bin/sh", "-c", "exec /worker --broker=${BROKER_ADDR} --qdrant=${QDRANT_ADDR} --embedder=\"${EMBEDDER_CMD}\""]

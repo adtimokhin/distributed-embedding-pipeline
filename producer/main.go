@@ -18,10 +18,7 @@ import (
 	"time"
 	"unicode"
 
-	pb "pipeline/proto"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"pipeline/internal/brokerclient"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -65,7 +62,7 @@ func chunkText(text string, maxWords int) []string {
 // Main
 // ──────────────────────────────────────────────────────────────────────────────
 
-func run(corpusPath, brokerAddr string, chunkSize int) error {
+func run(corpusPath string, brokerAddrs []string, chunkSize int) error {
 	// ── Open corpus ──────────────────────────────────────────────────────────
 	f, err := os.Open(corpusPath)
 	if err != nil {
@@ -79,16 +76,9 @@ func run(corpusPath, brokerAddr string, chunkSize int) error {
 	}
 	defer gr.Close()
 
-	// ── Connect to broker ────────────────────────────────────────────────────
-	conn, err := grpc.NewClient(brokerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("dial broker: %w", err)
-	}
-	defer conn.Close()
-	client := pb.NewBrokerClient(conn)
+	// ── Broker client (Raft cluster: follows redirects, retries across nodes) ─
+	client := brokerclient.New(brokerAddrs)
 	ctx := context.Background()
-	_ = client // used in TODO block below
-	_ = ctx    // used in TODO block below
 
 	// ── Submit tasks ─────────────────────────────────────────────────────────
 	var taskIDs []string
@@ -113,11 +103,11 @@ func run(corpusPath, brokerAddr string, chunkSize int) error {
 			if err != nil {
 				return fmt.Errorf("marshal payload: %w", err)
 			}
-			resp, err := client.Submit(ctx, &pb.SubmitRequest{Payload: string(payloadBytes)})
+			taskID, err := client.Submit(ctx, string(payloadBytes))
 			if err != nil {
 				return fmt.Errorf("submit task: %w", err)
 			}
-			taskIDs = append(taskIDs, resp.TaskId)
+			taskIDs = append(taskIDs, taskID)
 			chunkCount++
 		}
 	}
@@ -125,9 +115,6 @@ func run(corpusPath, brokerAddr string, chunkSize int) error {
 	log.Printf("submitted %d chunks from %d articles — waiting for completion...", chunkCount, articleCount)
 
 	// ── Wait for all tasks ───────────────────────────────────────────────────
-	// TODO (Stage 1): poll client.GetResult for each id in taskIDs until all
-	// return done=true. A simple approach: loop until the pending set is empty,
-	// sleeping 200ms between sweeps.
 	pending := make(map[string]bool)
 	for _, id := range taskIDs {
 		pending[id] = true
@@ -135,14 +122,14 @@ func run(corpusPath, brokerAddr string, chunkSize int) error {
 
 	for len(pending) > 0 {
 		for id := range pending {
-			resp, err := client.GetResult(ctx, &pb.GetResultRequest{TaskId: id})
+			done, errMsg, err := client.GetResult(ctx, id)
 			if err != nil {
 				log.Printf("GetResult %s: %v", id, err)
 				continue
 			}
-			if resp.Done {
-				if resp.Error != "" {
-					log.Printf("task %s failed: %s", id, resp.Error)
+			if done {
+				if errMsg != "" {
+					log.Printf("task %s failed: %s", id, errMsg)
 				}
 				delete(pending, id)
 			}
@@ -158,11 +145,11 @@ func run(corpusPath, brokerAddr string, chunkSize int) error {
 
 func main() {
 	corpusPath := flag.String("corpus", "corpus/wiki.jsonl.gz", "path to gzipped JSONL corpus")
-	brokerAddr := flag.String("broker", "localhost:9000", "broker gRPC address")
+	brokerAddrs := flag.String("broker", "localhost:9000,localhost:9001,localhost:9002", "comma-separated broker gRPC addresses (client-facing)")
 	chunkSize := flag.Int("chunk-size", 200, "max words per chunk")
 	flag.Parse()
 
-	if err := run(*corpusPath, *brokerAddr, *chunkSize); err != nil {
+	if err := run(*corpusPath, strings.Split(*brokerAddrs, ","), *chunkSize); err != nil {
 		log.Fatal(err)
 	}
 }

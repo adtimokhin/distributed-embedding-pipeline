@@ -11,7 +11,7 @@
 - [x] Stage 1 - Broker, workers, and producer
 - [x] Stage 2 - At-least-once delivery
 - [x] Stage 3 - Containerized deployment
-- [ ] Extension - Persistent broker WAL
+- [x] Extension - Raft-replicated broker (3-node cluster, reusing HW3's `raft` package; see README.md "Design decisions actually implemented")
 
 ---
 

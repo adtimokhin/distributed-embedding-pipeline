@@ -1,0 +1,7 @@
+{
+  "nodes": [
+    {"id": 0, "client_addr": "localhost:9000", "peer_addr": "broker0:9100"},
+    {"id": 1, "client_addr": "localhost:9001", "peer_addr": "broker1:9101"},
+    {"id": 2, "client_addr": "localhost:9002", "peer_addr": "broker2:9102"}
+  ]
+}

@@ -1,25 +1,67 @@
 services:
-  broker:
+  broker0:
     build:
       context: .
       dockerfile: Dockerfile.broker
+    command: ["--id=0", "--config=/etc/pipeline/broker_nodeconfig.json"]
+    volumes:
+      - ./broker_nodeconfig-docker.json:/etc/pipeline/broker_nodeconfig.json:ro
     ports:
       - "9000:9000"
+      - "9100:9100"
+    networks:
+      - raft
+
+  broker1:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    command: ["--id=1", "--config=/etc/pipeline/broker_nodeconfig.json"]
+    volumes:
+      - ./broker_nodeconfig-docker.json:/etc/pipeline/broker_nodeconfig.json:ro
+    ports:
+      - "9001:9001"
+      - "9101:9101"
+    networks:
+      - raft
+
+  broker2:
+    build:
+      context: .
+      dockerfile: Dockerfile.broker
+    command: ["--id=2", "--config=/etc/pipeline/broker_nodeconfig.json"]
+    volumes:
+      - ./broker_nodeconfig-docker.json:/etc/pipeline/broker_nodeconfig.json:ro
+    ports:
+      - "9002:9002"
+      - "9102:9102"
+    networks:
+      - raft
 
   qdrant:
     image: qdrant/qdrant:latest
     ports:
       - "6333:6333"
       - "6334:6334"
+    networks:
+      - raft
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile.worker
     environment:
-      - BROKER_ADDR=broker:9000
+      - BROKER_ADDR=broker0:9000,broker1:9000,broker2:9000
       - QDRANT_ADDR=qdrant:6334
       - EMBEDDER_CMD=python3 /app/embedder.py
     depends_on:
-      - broker
+      - broker0
+      - broker1
+      - broker2
       - qdrant
+    networks:
+      - raft
+
+networks:
+  raft:
+    driver: bridge
