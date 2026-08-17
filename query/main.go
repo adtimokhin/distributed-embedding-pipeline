@@ -1,19 +1,19 @@
 // Query CLI — HW4 embedding pipeline semantic search.
 //
-// Embeds a natural-language query using the same subprocess protocol as the
-// worker, then runs a kNN search against Qdrant and prints the top-K passages.
+// Embeds a natural-language query using the same long-lived embedder
+// subprocess pattern as the worker, then runs a kNN search against Qdrant
+// and prints the top-K passages.
 
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"os/exec"
 	"strings"
+
+	"pipeline/internal/embedder"
 
 	qdrant "github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
@@ -23,73 +23,19 @@ import (
 const QdrantCollection = "documents"
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Subprocess protocol (same as worker)
-// ──────────────────────────────────────────────────────────────────────────────
-
-type embedRequest struct {
-	ChunkID string `json:"chunk_id"`
-	Text    string `json:"text"`
-}
-
-type embedResponse struct {
-	ChunkID string    `json:"chunk_id"`
-	Vector  []float32 `json:"vector"`
-}
-
-// embedQuery embeds the query string using the subprocess at cmdStr.
-// Spawns and tears down the subprocess for each query (queries are infrequent).
-func embedQuery(cmdStr, queryText string) ([]float32, error) {
-	parts := strings.Fields(cmdStr)
-	if len(parts) == 0 {
-		return nil, fmt.Errorf("empty embedder command")
-	}
-
-	cmd := exec.Command(parts[0], parts[1:]...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start embedder: %w", err)
-	}
-	defer cmd.Process.Kill() //nolint:errcheck
-
-	w := bufio.NewWriter(stdin)
-	r := bufio.NewScanner(stdout)
-
-	req := embedRequest{ChunkID: "query", Text: queryText}
-	line, _ := json.Marshal(req)
-	if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
-		return nil, err
-	}
-	if err := w.Flush(); err != nil {
-		return nil, err
-	}
-
-	if !r.Scan() {
-		return nil, fmt.Errorf("no response from embedder")
-	}
-	var resp embedResponse
-	if err := json.Unmarshal(r.Bytes(), &resp); err != nil {
-		return nil, fmt.Errorf("decode embedder response: %w", err)
-	}
-	return resp.Vector, nil
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────────────────────
 
-func run(queryText, qdrantAddr, embedderCmd string, topK int) error {
+// run embeds queryText using emb — a subprocess started once by main and
+// reused across every query, rather than spawned and killed per call — then
+// runs a kNN search against Qdrant.
+func run(emb *embedder.Embedder, queryText, qdrantAddr string, topK int) error {
 	// ── Embed the query ──────────────────────────────────────────────────────
-	vector, err := embedQuery(embedderCmd, queryText)
+	embedResp, err := emb.Embed(embedder.Request{ChunkID: "query", Text: queryText})
 	if err != nil {
 		return fmt.Errorf("embed query: %w", err)
 	}
+	vector := embedResp.Vector
 
 	// ── Connect to Qdrant ────────────────────────────────────────────────────
 	conn, err := grpc.NewClient(qdrantAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -139,7 +85,13 @@ func main() {
 	}
 	queryText := strings.Join(flag.Args(), " ")
 
-	if err := run(queryText, *qdrantAddr, *embedderCmd, *topK); err != nil {
+	emb, err := embedder.Start(*embedderCmd)
+	if err != nil {
+		log.Fatalf("start embedder: %v", err)
+	}
+	defer emb.Close() //nolint:errcheck
+
+	if err := run(emb, queryText, *qdrantAddr, *topK); err != nil {
 		log.Fatal(err)
 	}
 }

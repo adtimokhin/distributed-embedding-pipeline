@@ -6,7 +6,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -14,11 +13,11 @@ import (
 	"log"
 	"math/big"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	"pipeline/internal/brokerclient"
+	"pipeline/internal/embedder"
 
 	qdrant "github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
@@ -36,88 +35,12 @@ const (
 	QdrantCollection  = "documents"
 )
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Subprocess protocol types
-// ──────────────────────────────────────────────────────────────────────────────
-
-type embedRequest struct {
-	ChunkID string `json:"chunk_id"`
-	Text    string `json:"text"`
-}
-
-type embedResponse struct {
-	ChunkID string    `json:"chunk_id"`
-	Vector  []float32 `json:"vector"`
-}
-
 // taskPayload mirrors what the producer encodes in Task.Payload.
 type taskPayload struct {
 	DocID   string `json:"doc_id"`
 	ChunkID string `json:"chunk_id"`
 	Title   string `json:"title"`
 	Text    string `json:"text"`
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Subprocess management
-// ──────────────────────────────────────────────────────────────────────────────
-
-type embedder struct {
-	cmd    *exec.Cmd
-	stdin  *bufio.Writer
-	stdout *bufio.Scanner
-}
-
-// startEmbedder spawns the embedding subprocess described by cmdStr.
-// cmdStr may be a space-separated command + arguments (e.g. "python3 embedder.py").
-func startEmbedder(cmdStr string) (*embedder, error) {
-	parts := strings.Fields(cmdStr)
-	if len(parts) == 0 {
-		return nil, fmt.Errorf("empty embedder command")
-	}
-	cmd := exec.Command(parts[0], parts[1:]...)
-
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start subprocess: %w", err)
-	}
-	return &embedder{
-		cmd:    cmd,
-		stdin:  bufio.NewWriter(stdinPipe),
-		stdout: bufio.NewScanner(stdoutPipe),
-	}, nil
-}
-
-// embed sends one request line and reads one response line.
-func (e *embedder) embed(req embedRequest) (embedResponse, error) {
-	line, err := json.Marshal(req)
-	if err != nil {
-		return embedResponse{}, fmt.Errorf("marshal request: %w", err)
-	}
-	if _, err := fmt.Fprintf(e.stdin, "%s\n", line); err != nil {
-		return embedResponse{}, fmt.Errorf("write to subprocess: %w", err)
-	}
-	if err := e.stdin.Flush(); err != nil {
-		return embedResponse{}, fmt.Errorf("flush subprocess stdin: %w", err)
-	}
-	if !e.stdout.Scan() {
-		if err := e.stdout.Err(); err != nil {
-			return embedResponse{}, fmt.Errorf("read from subprocess: %w", err)
-		}
-		return embedResponse{}, fmt.Errorf("subprocess closed stdout unexpectedly")
-	}
-	var resp embedResponse
-	if err := json.Unmarshal(e.stdout.Bytes(), &resp); err != nil {
-		return embedResponse{}, fmt.Errorf("decode subprocess response: %w", err)
-	}
-	return resp, nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -200,10 +123,11 @@ func run(brokerAddrs []string, qdrantAddr, embedderCmd string) error {
 	qdrantClient := qdrant.NewPointsClient(qdrantConn)
 
 	// ── Spawn embedding subprocess ───────────────────────────────────────────
-	emb, err := startEmbedder(embedderCmd)
+	emb, err := embedder.Start(embedderCmd)
 	if err != nil {
 		return fmt.Errorf("start embedder: %w", err)
 	}
+	defer emb.Close() //nolint:errcheck
 
 	// ── Worker ID ────────────────────────────────────────────────────────────
 	workerID := fmt.Sprintf("worker-%d", os.Getpid())
@@ -249,7 +173,7 @@ func run(brokerAddrs []string, qdrantAddr, embedderCmd string) error {
 			return fmt.Errorf("decode task payload: %w", err)
 		}
 
-		embedResp, err := emb.embed(embedRequest{ChunkID: p.ChunkID, Text: p.Text})
+		embedResp, err := emb.Embed(embedder.Request{ChunkID: p.ChunkID, Text: p.Text})
 		if err != nil {
 			log.Printf("embed task %s: %v", task.Id, err)
 			cancelHB()
