@@ -2,12 +2,11 @@
 //
 // Exposes the same embed-query-then-kNN-search path the query CLI uses
 // (internal/retrieval) as a long-running HTTP service, so an agent can call
-// it synchronously instead of shelling out to a CLI. This is what makes the
-// pipeline's index actually reachable from a RAG system — TO_IMPLEMENT.md
-// item 3. It also exposes synchronous single-document ingestion
-// (internal/indexer) — TO_IMPLEMENT.md item 4 — for adding one document an
-// agent just produced without standing up the batch broker/producer/worker
-// pipeline for it.
+// it synchronously instead of shelling out to a CLI — what makes the
+// pipeline's index actually reachable from a RAG system. It also exposes
+// synchronous single-document ingestion (internal/indexer) for adding one
+// document an agent just produced, without standing up the batch
+// broker/producer/worker pipeline for it.
 //
 // POST /search   {"query": "...", "top_k": 5}
 //
@@ -21,11 +20,10 @@
 // chunk-ID -> Qdrant point-ID mapping, same as the batch path) rather than
 // duplicating them — but if the new text chunks into fewer passages than
 // before, stale trailing chunks from the old version are not deleted; no
-// delete/update path exists yet (see TO_IMPLEMENT.md's deferred items).
+// delete/update path exists yet.
 //
 // The embedder subprocess and Qdrant connection are both established once at
-// startup and held for the server's lifetime (TO_IMPLEMENT.md item 2) rather
-// than per-request.
+// startup and held for the server's lifetime rather than per-request.
 package main
 
 import (
@@ -115,10 +113,10 @@ type ingestResponse struct {
 	ChunkIDs []string `json:"chunk_ids"`
 }
 
-// handleIngest chunks, embeds, and upserts one document synchronously —
-// TO_IMPLEMENT.md item 4. Unlike the batch pipeline, this never touches the
-// broker: it's the "agent just produced a document, index it now" path, not
-// bulk (re)indexing.
+// handleIngest chunks, embeds, and upserts one document synchronously.
+// Unlike the batch pipeline, this never touches the broker: it's the
+// "agent just produced a document, index it now" path, not bulk
+// (re)indexing.
 func (s *server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "only POST is supported")

@@ -18,16 +18,19 @@ A distributed pipeline that chunks Wikipedia articles, fans the chunks out to a 
 go test ./... -race
 ```
 
-49 tests across 6 packages — no Docker/Qdrant/broker processes required, no
-network sockets (the broker cluster tests run over `bufconn`, in-memory
-gRPC transport, same pattern as HW3's test harness). Covers: the broker's
-replicated-state logic in isolation, a full 3-node cluster including a
-leader-crash-mid-task recovery test, `internal/brokerclient`'s redirect/
-retry logic, the embedder subprocess including a concurrency regression
-test, chunking/upsert/ingestion logic, retrieval, and the HTTP handlers.
-See [TO_TEST.md](TO_TEST.md) for what's covered where and what's still
-gaps (partition/heal cluster tests, worker/producer's own orchestration
-code, real-Qdrant-wire-protocol tests, CI).
+64 test functions across 6 packages (several table-driven with multiple
+subtests) — no Docker/Qdrant/broker processes required, no network sockets
+(the broker cluster tests run over `bufconn`, in-memory gRPC transport).
+Covers: the broker's replicated-state logic in isolation, a full 3-node
+cluster including leader-crash and quorum-loss recovery, `internal/brokerclient`'s
+redirect/retry logic, the embedder subprocess including a concurrency
+regression test, chunking/upsert/ingestion logic and edge cases, retrieval,
+and the HTTP handlers.
+
+Known remaining gaps: partition-and-heal / repeated-failure cluster tests,
+`worker`/`producer`'s own orchestration code (the logic they call is
+tested, the loop wiring isn't), real-Qdrant-wire-protocol tests (everything
+here uses a fake `qdrant.PointsClient`), and no CI workflow.
 
 ## Quick start
 
@@ -133,8 +136,8 @@ Scaling was negative, not just sub-linear: 4 containers on one host compete for 
 ├── internal/retrieval/         ← implementation — shared embed+kNN-search logic (query, queryserver)
 ├── internal/indexer/           ← implementation — shared chunk/embed/upsert logic (worker, producer, queryserver's /ingest)
 ├── internal/testutil/          ← test-only — builds tools/mock_embedder for packages that need a real subprocess
-├── */..._test.go               ← tests — see TO_TEST.md; broker/test_helpers_test.go ports HW3's bufconn cluster harness
-├── raft/, config/, internal/log/ ← copied from HW3 (own module, so vendored not imported); raft.go unmodified
+├── */..._test.go               ← tests — broker/test_helpers_test.go ports a bufconn-based 3-node cluster test harness
+├── raft/, config/, internal/log/ ← Raft consensus implementation, cluster config, and its append-only log
 ├── broker_nodeconfig.json      ← implementation — local 3-node cluster addresses
 ├── broker_nodeconfig-docker.json ← implementation — Docker Compose cluster addresses
 ├── Dockerfile.broker           ← implementation (Stage 3)
@@ -142,5 +145,3 @@ Scaling was negative, not just sub-linear: 4 containers on one host compete for 
 ├── docker-compose.yml          ← implementation (Stage 3) — broker0/broker1/broker2 + qdrant + worker
 └── proto/, corpus/, tools/     ← provided, unmodified (proto/raft.proto copied from HW3 alongside the provided broker.proto)
 ```
-
-See [TO_TEST.md](TO_TEST.md) for test coverage by package and remaining gaps, and [TO_IMPLEMENT.md](TO_IMPLEMENT.md) for the scoping behind the RAG-usability additions (persistent embedder, HTTP retrieval/ingestion API).
