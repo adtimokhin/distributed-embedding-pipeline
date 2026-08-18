@@ -12,6 +12,23 @@ A distributed pipeline that chunks Wikipedia articles, fans the chunks out to a 
 | **Query CLI** (`query/`) | Embeds a query string, runs kNN search against Qdrant, prints top-k results. |
 | **Query server** (`queryserver/`) | HTTP API — `POST /search {"query", "top_k"}` for retrieval, `POST /ingest {"doc_id", "title", "text"}` for synchronous single-document indexing — for calling into the index from an agent/RAG system instead of a CLI or the batch pipeline. Same embed+search logic as the CLI (`internal/retrieval`) and same chunk/embed/upsert logic as the worker (`internal/indexer`), served from a long-lived process instead of a one-shot invocation. |
 
+## Testing
+
+```bash
+go test ./... -race
+```
+
+49 tests across 6 packages — no Docker/Qdrant/broker processes required, no
+network sockets (the broker cluster tests run over `bufconn`, in-memory
+gRPC transport, same pattern as HW3's test harness). Covers: the broker's
+replicated-state logic in isolation, a full 3-node cluster including a
+leader-crash-mid-task recovery test, `internal/brokerclient`'s redirect/
+retry logic, the embedder subprocess including a concurrency regression
+test, chunking/upsert/ingestion logic, retrieval, and the HTTP handlers.
+See [TO_TEST.md](TO_TEST.md) for what's covered where and what's still
+gaps (partition/heal cluster tests, worker/producer's own orchestration
+code, real-Qdrant-wire-protocol tests, CI).
+
 ## Quick start
 
 ```bash
@@ -116,6 +133,8 @@ hw4/
 ├── internal/embedder/          ← implementation — shared long-lived embedder subprocess (worker, query, queryserver)
 ├── internal/retrieval/         ← implementation — shared embed+kNN-search logic (query, queryserver)
 ├── internal/indexer/           ← implementation — shared chunk/embed/upsert logic (worker, producer, queryserver's /ingest)
+├── internal/testutil/          ← test-only — builds tools/mock_embedder for packages that need a real subprocess
+├── */..._test.go               ← tests — see TO_TEST.md; broker/test_helpers_test.go ports HW3's bufconn cluster harness
 ├── raft/, config/, internal/log/ ← copied from HW3 (own module, so vendored not imported); raft.go unmodified
 ├── broker_nodeconfig.json      ← implementation — local 3-node cluster addresses
 ├── broker_nodeconfig-docker.json ← implementation — Docker Compose cluster addresses
@@ -126,4 +145,4 @@ hw4/
 └── REFLECTIONS.md
 ```
 
-See [REFLECTIONS.md](REFLECTIONS.md) for the full delivery-semantics trace, the comparison with HW3's Raft-based approach to fault tolerance, and the throughput-scaling analysis.
+See [REFLECTIONS.md](REFLECTIONS.md) for the full delivery-semantics trace, the comparison with HW3's Raft-based approach to fault tolerance, and the throughput-scaling analysis. See [TO_TEST.md](TO_TEST.md) for test coverage by package and remaining gaps.

@@ -1,161 +1,134 @@
 # TO_TEST — what's needed to actually test this software
 
-Scoping outline, companion to `TO_IMPLEMENT.md`. `hw4/` currently has **zero**
-`*_test.go` files — every claim about the Raft-replicated broker (leader
-election, failover, redirect-following) was verified by hand: running 3
-broker processes locally, `kill -9`-ing the leader mid-run, and reading log
-output / Qdrant point counts. That's fine for a one-time check, not for
-catching a regression the next time this changes. This lists the test
-infrastructure and suites needed to make that verification repeatable, plus
-what to add once `TO_IMPLEMENT.md`'s items land. Nothing here is written yet.
+Originally a scoping outline written when `hw4/` had **zero** `*_test.go`
+files and every claim about the Raft-replicated broker was verified by hand.
+Sections 1–3 and most of 5 are now implemented — 49 tests across 6 packages,
+all passing under `-race`. What's left is noted inline and in the final
+section.
+
+```
+go test ./... -race
+```
 
 ---
 
-## 1. Unit tests for the broker's replicated-state logic
+## 1. Unit tests for the broker's replicated-state logic — ✅ done
 
-**What's needed:** tests for the pure, network-free pieces of
-`broker/main.go`:
-- `encodeSubmit`/`encodeComplete`/`decodeCommand` (`broker/main.go:118-143`)
-  round-trip correctly, including the case that currently relies on silent
-  fallthrough: `decodeCommand` on Raft's own `"noop"` leader-election marker
-  must decode to `op=""` and be ignored, not misparsed.
-- `applyLoop` (`broker/main.go:145-172`) applied against a fed `commitCh`:
-  `submit` populates `submitted`/`submittedOrder` and is a no-op on a
-  duplicate id; `complete` sets `done`/`errors` and clears any matching
-  `inflight` entry; a `pendingOps` waiter is woken with the committed term.
-- `Poll`'s derived-pending-view scan (`broker/main.go:213-236`) — skips
-  anything in `done` or `inflight`, returns tasks in `submittedOrder`.
-- `refreshLeaderState` (`broker/main.go:302-315`) — the inflight-reset-on
-  false→true transition. This one only exists because of a real bug class
-  (stale inflight entries from an earlier leadership stint silently
-  blocking a task forever) and currently has no coverage at all beyond the
-  log line I read manually during the original smoke test.
+`broker/command_test.go`: `encodeSubmit`/`encodeComplete`/`decodeCommand`
+round-trip (including the Raft `"noop"` marker decoding to a silently-ignored
+empty op), `applyLoop`'s effect on `submitted`/`submittedOrder`/`done`/
+`errors`/`inflight` given a synthetic `commitCh`, idempotent re-submission of
+the same task ID, and `pendingOps` being woken with the committed term.
 
-**Why it's needed:** these are the parts of the design doc
-(`README.md`'s "Design decisions actually implemented") that are the actual
-novel logic of this extension — everything else is wiring. They're also the
-cheapest tests to write: no network, no goroutines, just state transitions.
-
-**Scope:** small. `brokerServer` fields are unexported but the test file
-lives in `package main` alongside it, same as any Go internal test.
+Not separately unit-tested: `refreshLeaderState`'s false→true reset logic
+and `Poll`'s derived-pending-view scan. Both call `s.rf.GetState()` inline,
+so isolating them from a real (or bufconn) Raft instance isn't possible
+without adding a testing seam — they're covered instead by the cluster
+integration tests in section 2, where `TestLeaderCrashDoesNotLoseSubmittedWork`
+exercises the exact false→true transition on a real new leader.
 
 ---
 
-## 2. Broker cluster integration tests (the part that's only been checked by hand)
+## 2. Broker cluster integration tests — ✅ done
 
-**What's needed:** automate the exact scenario I ran manually — a 3-node
-cluster, `Submit`/`Poll`/`Complete`/`GetResult` round-tripping correctly,
-and a leader crash mid-flight producing a new leader without losing
-submitted-but-incomplete work.
+`broker/test_helpers_test.go` ports `hw3/server/test_helpers_test.go`'s
+bufconn-based 3-node harness (`raft.NewPaused` + `SetPeerClient` + `Resume`,
+a `proxyClient` for partitions) from the KVStore service to the Broker
+service — `raft.go` was copied unmodified, so nothing about the harness
+itself needed to change.
 
-**Don't build this from scratch** — `hw3/server/test_helpers_test.go` already
-has exactly the harness this needs: `newTestCluster` wires a 3-node Raft
-cluster over `bufconn` (in-memory transport, no real sockets) using
-`raft.NewPaused` + `SetPeerClient` + `Resume`, with a proxy client that can
-simulate a partition by refusing to forward RPCs. `hw4/broker/main.go`'s
-`newBrokerServer` (`broker/main.go:94-108`) calls `raft.New` directly, which
-would need a `NewPaused`-based constructor path (or a test-only variant) to
-be wired into that harness the same way `hw3/server/main.go` is — `raft.go`
-was copied unmodified, so nothing about the harness itself needs to change,
-only how `brokerServer` is constructed in tests.
+`broker/cluster_test.go`:
+- `TestSubmitPollCompleteGetResultRoundTrip` — full RPC round trip on a
+  healthy cluster, including that a second `Poll` doesn't hand out a task
+  that's already in-flight.
+- `TestClusterRedirectsNonLeaderCalls` — `Submit`/`Poll`/`Heartbeat`/
+  `Complete` against a follower return `redirect_addr` pointing at the
+  actual leader.
+- `TestGetResultServedByAnyNode` — `GetResult` never redirects; every node
+  eventually agrees a completed task is done.
+- `TestLeaderCrashDoesNotLoseSubmittedWork` — the flagship test: submits a
+  task, polls it (making it in-flight), kills the leader, confirms a new
+  leader is elected, confirms previously-completed work survived, and
+  confirms the in-flight-but-never-completed task becomes pollable again on
+  the new leader. This is the automated version of the original manual
+  "kill -9 the leader, watch the producer recover" check.
 
-Minimum scenarios once the harness exists:
-- Submit → Poll → Complete → GetResult on a healthy cluster.
-- `Submit`/`Poll`/`Heartbeat`/`Complete` against a follower returns
-  `redirect_addr` pointing at the actual leader.
-- Kill/partition the leader mid-task; confirm a new leader is elected,
-  in-flight tasks become pollable again (the `refreshLeaderState` reset),
-  and previously committed `done` state survives on the new leader.
-- Partition-and-heal: a node that missed several commits catches up (this
-  is the `nextIndex` backoff path — already observed once manually taking
-  196 round trips to resync a far-behind node; worth a bound so a
-  regression doesn't silently make this pathological).
-
-**Why it's needed:** this is the entire point of the extension. Right now
-"the Raft-replicated broker survives a leader crash" is a claim backed by
-one manual run, not a test that fails if someone changes `Poll`'s scan logic
-and reintroduces a duplicate-assignment bug.
-
-**Scope:** medium — the harness is a copy-and-adapt job from `hw3`, the
-scenarios themselves are straightforward given the harness exists.
+Not covered: partition-and-heal (a node missing commits catching up via the
+`nextIndex` backoff path) and repeated/cascading leader failures. Both are
+straightforward extensions of the existing harness (`tc.isolate`/
+`tc.reconnect` are already ported) — just not written yet.
 
 ---
 
-## 3. `internal/brokerclient` tests
+## 3. `internal/brokerclient` tests — ✅ done
 
-**What's needed:** unit tests for `Client.call`'s retry/redirect logic
-(`internal/brokerclient/client.go:74-111`) against a fake `pb.BrokerClient`
-(no real broker needed) covering:
-- A redirect to an address in the client's own list jumps straight there
-  (`addrIndex` match, `client.go:60-72`).
-- A redirect to an unknown address (the Docker-vs-host hostname mismatch
-  case the design doc calls out) falls back to round-robin instead of
-  failing.
-- Exhausting `maxHops` returns an error rather than looping forever.
-- A connection error (not just a redirect) also advances to the next
-  address.
-
-**Why it's needed:** this is the piece standing between "the broker cluster
-tolerates a leader crash" and "the worker/producer actually notice and
-recover" — and it's the one part of this extension that's pure logic with no
-Raft or gRPC server involved, so it's the cheapest integration risk to
-close.
-
-**Scope:** small. A fake `pb.BrokerClient` implementation returning
-scripted responses is enough; no real network or broker process needed.
+`internal/brokerclient/client_test.go`, against real loopback-TCP fake
+`pb.BrokerServer` implementations (bufconn wasn't an option here — see the
+file's doc comment for why): follows a redirect to a known address directly,
+falls back to round-robin on a redirect to an address it doesn't recognize
+(the Docker-vs-host mismatch case), advances past a dead address, returns an
+error once the whole configured cluster is unreachable, and confirms
+`GetResult` never redirects.
 
 ---
 
-## 4. Worker/producer pipeline tests
+## 4. Worker/producer pipeline tests — partially superseded, gap remains
 
-**What's needed:** an end-to-end test of chunk → embed → upsert using
-`tools/mock_embedder` (already deterministic, already used for manual
-verification) against either a real Qdrant container or a fake
-`qdrant.PointsClient`. Minimum coverage:
-- A chunk submitted twice (simulating the at-least-once re-enqueue path)
-  produces one Qdrant point, not two — the idempotency claim
-  `README.md` makes but that has no automated check.
-- `chunkText` (producer) chunk boundaries and `taskPayload` JSON round-trip
-  through the broker unchanged.
-
-**Why it's needed:** the idempotent-upsert argument is the load-bearing
-correctness claim for *both* the original at-least-once design and the new
-"Poll/Heartbeat don't need to be replicated" argument in `TO_IMPLEMENT.md`'s
-companion doc. It's asserted in prose in two places and tested in neither.
-
-**Scope:** medium — mainly gated on picking a Qdrant test strategy (see
-Testing infrastructure below).
+The chunking and upsert logic this section originally called out
+(`chunkText`, `chunkIDToUUID`, idempotent duplicate upserts) has since moved
+into `internal/indexer` and is covered there (section 5). What's *not*
+covered is `worker.go`'s and `producer.go`'s own remaining code — the poll
+loop, heartbeat goroutine, and corpus-reading/submission loop — which is now
+thin orchestration around already-tested packages rather than untested
+business logic, but is still only verified by the manual end-to-end runs
+done during development, not by an automated test.
 
 ---
 
-## 5. Tests for the `TO_IMPLEMENT.md` additions (once built)
+## 5. Tests for the `TO_IMPLEMENT.md` additions — ✅ done
 
-Forward-looking — add these alongside each item as it's implemented, not
-before:
-- **kNN search (`query.go`):** given known vectors upserted into a test
-  Qdrant collection, `Search` returns the expected top-k ordering.
-- **Persistent query embedder:** same input text embedded twice returns the
-  same vector (determinism check), and the subprocess survives multiple
-  sequential queries without being respawned.
-- **Retrieval API (HTTP/MCP):** request/response contract tests — valid
-  query returns well-formed JSON, malformed input is rejected cleanly,
-  matches the shape documented in `TO_IMPLEMENT.md` item 3.
-- **Sync single-doc ingestion path:** a document ingested through this path
-  is immediately retrievable via the search endpoint (the actual point of
-  bypassing the broker for one-off adds), and ingesting the same document
-  twice doesn't duplicate points (same `chunkIDToUUID` idempotency as #4).
+- **kNN search / retrieval:** `internal/retrieval/retrieval_test.go` — query
+  embedding is sent to Qdrant, `ScoredPoint`s map to `Result` fields
+  correctly, empty results return `[]` not `nil`, and a point with missing
+  payload keys doesn't panic.
+- **Persistent embedder:** `internal/embedder/embedder_test.go` — a single
+  subprocess (same PID) serves multiple sequential `Embed` calls, identical
+  text embeds identically, and — the actual regression test for the
+  concurrency bug this work surfaced — 20 goroutines × 20 calls each embed
+  concurrently with no interleaved/mismatched responses.
+- **HTTP retrieval + ingestion API:** `queryserver/main_test.go` — `/search`
+  and `/ingest` request validation, defaults (`top_k`, `chunk_size`),
+  clamping, method checks (405 on GET), and malformed-JSON/missing-field 400s,
+  via `httptest` against the real handlers (fakes only at the Qdrant
+  boundary).
+- **Sync single-doc ingestion:** `internal/indexer/indexer_test.go` —
+  `ChunkText` boundaries (including empty input and unicode whitespace),
+  `ChunkIDToUUID` determinism, `EnsureCollection`'s create-if-missing /
+  skip-if-exists branches, `UpsertChunk`'s payload shape, and
+  `IngestDocument`'s end-to-end chunk→embed→upsert count.
+
+`internal/testutil/embedder.go` (not a `_test.go` file, so it's importable
+across packages) builds `tools/mock_embedder` once per test binary for the
+three packages (`embedder`, `indexer`, `retrieval`/`queryserver`) that need a
+real subprocess because `IngestDocument`/`Search` take a concrete
+`*embedder.Embedder`, not an interface.
 
 ---
 
-## Testing infrastructure gaps (blocking items 2 and 4)
+## Remaining gaps
 
-- **Qdrant in tests:** no test double or container strategy exists yet.
-  Options: `testcontainers-go` spinning up real `qdrant/qdrant`, or a small
-  in-memory fake implementing just the `PointsClient`/`CollectionsClient`
-  RPCs this codebase actually calls (`Get`, `Create`, `Upsert`, `Search`).
-  The fake is faster and has no Docker dependency; the real container is
-  higher-fidelity and would also exercise the actual gRPC wire format.
-- **No CI workflow.** There's no `.github/workflows/` in this repo at all,
-  for any homework — so none of the above runs automatically today even
-  once written. Not blocking for local development, but worth flagging
-  since "tests exist" and "tests run on every change" are different claims.
+- **Partition-and-heal / repeated-failure cluster tests** (section 2) — the
+  harness supports them, they're just not written.
+- **Worker/producer orchestration itself** (section 4) — the logic it calls
+  is tested; the loop/goroutine wiring isn't.
+- **No Qdrant container tests.** Every test here uses a fake
+  `qdrant.PointsClient`/`CollectionsClient` (interface embedding — only the
+  methods actually called are overridden). That's deliberate: faster, no
+  Docker dependency, and sufficient for testing this codebase's logic — but
+  it never exercises the real Qdrant wire protocol, so a change that's
+  correct against the fake but wrong against real Qdrant wouldn't be caught.
+  `testcontainers-go` would close this gap if it's ever worth the added
+  runtime and Docker dependency in tests.
+- **No CI workflow.** Still no `.github/workflows/` anywhere in this repo —
+  `go test ./... -race` is a command you run, not something that runs on
+  every push.
