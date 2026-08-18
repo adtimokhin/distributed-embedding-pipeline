@@ -2,6 +2,7 @@ package retrieval
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"pipeline/internal/embedder"
@@ -121,5 +122,36 @@ func TestSearchMissingPayloadFieldsDoNotPanic(t *testing.T) {
 	}
 	if results[0].DocID != "" || results[0].Title != "" || results[0].Text != "" {
 		t.Errorf("results[0] = %+v, want all-empty string fields for a point with no matching payload keys", results[0])
+	}
+}
+
+// fakeErroringSearchClient always fails Search, for testing that Qdrant
+// errors propagate out of Search rather than being swallowed.
+type fakeErroringSearchClient struct {
+	qdrant.PointsClient
+}
+
+func (f *fakeErroringSearchClient) Search(_ context.Context, _ *qdrant.SearchPoints, _ ...grpc.CallOption) (*qdrant.SearchResponse, error) {
+	return nil, fmt.Errorf("qdrant unavailable")
+}
+
+func TestSearchPropagatesQdrantError(t *testing.T) {
+	emb := startTestEmbedder(t)
+	fc := &fakeErroringSearchClient{}
+
+	if _, err := Search(context.Background(), fc, emb, "query", 5); err == nil {
+		t.Fatal("Search returned nil error when Qdrant Search failed, want the error propagated")
+	}
+}
+
+func TestSearchZeroTopK(t *testing.T) {
+	emb := startTestEmbedder(t)
+	fc := &fakeSearchClient{response: &qdrant.SearchResponse{}}
+
+	if _, err := Search(context.Background(), fc, emb, "query", 0); err != nil {
+		t.Fatalf("Search with topK=0: %v", err)
+	}
+	if fc.lastRequest.Limit != 0 {
+		t.Errorf("Limit sent to Qdrant = %d, want 0 (Search itself doesn't default topK — that's the HTTP layer's job)", fc.lastRequest.Limit)
 	}
 }

@@ -228,3 +228,56 @@ func TestClientGetResultNeverRedirects(t *testing.T) {
 		t.Error("GetResult: done = false, want true (fake always reports done)")
 	}
 }
+
+// ── Edge cases ───────────────────────────────────────────────────────────────
+
+// TestClientEmptyAddressListReturnsErrorNotPanic is a regression test: call
+// used to index c.addrs[c.current] unconditionally, so an empty address
+// list panicked with "index out of range" instead of failing cleanly.
+func TestClientEmptyAddressListReturnsErrorNotPanic(t *testing.T) {
+	c := New(nil)
+	if _, err := c.Submit(context.Background(), "payload"); err == nil {
+		t.Fatal("Submit with no configured addresses returned nil error, want an error")
+	}
+
+	c2 := New([]string{})
+	if _, _, err := c2.Poll(context.Background(), "worker-1"); err == nil {
+		t.Fatal("Poll with no configured addresses returned nil error, want an error")
+	}
+}
+
+func TestClientSingleAddressCluster(t *testing.T) {
+	addr := startFakeBroker(t, &fakeBroker{ok: true, taskID: "t1"})
+	c := New([]string{addr})
+
+	taskID, err := c.Submit(context.Background(), "payload")
+	if err != nil {
+		t.Fatalf("Submit error: %v", err)
+	}
+	if taskID != "t1" {
+		t.Errorf("taskID = %q, want %q", taskID, "t1")
+	}
+}
+
+// TestClientAllAddressesRedirectToEachOther simulates a cluster with no
+// leader at all (e.g. mid-election): every node reports "not me, try the
+// other one." Client must give up after its bounded hop count rather than
+// looping forever.
+func TestClientAllAddressesRedirectToEachOther(t *testing.T) {
+	brokerA := &fakeBroker{}
+	brokerB := &fakeBroker{}
+
+	addrA := startFakeBroker(t, brokerA)
+	addrB := startFakeBroker(t, brokerB)
+	brokerA.mu.Lock()
+	brokerA.redirectAddr = addrB
+	brokerA.mu.Unlock()
+	brokerB.mu.Lock()
+	brokerB.redirectAddr = addrA
+	brokerB.mu.Unlock()
+
+	c := New([]string{addrA, addrB})
+	if _, err := c.Submit(context.Background(), "payload"); err == nil {
+		t.Fatal("Submit against a cluster with no leader returned nil error, want an error after bounded retries")
+	}
+}

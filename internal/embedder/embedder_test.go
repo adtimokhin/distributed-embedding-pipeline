@@ -121,3 +121,40 @@ func TestEmbedConcurrentCallsDoNotInterleave(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// ── Edge cases: subprocess failures ─────────────────────────────────────────
+
+func TestStartWithNonexistentCommandErrors(t *testing.T) {
+	if _, err := Start("/no/such/binary/exists"); err == nil {
+		t.Fatal("Start with a nonexistent command returned nil error, want an error")
+	}
+}
+
+func TestStartWithEmptyCommandErrors(t *testing.T) {
+	if _, err := Start(""); err == nil {
+		t.Fatal("Start with an empty command returned nil error, want an error")
+	}
+}
+
+// TestEmbedAfterSubprocessExitsReturnsError verifies that calling Embed once
+// the underlying subprocess has died surfaces a clean error ("subprocess
+// closed stdout unexpectedly") instead of hanging or panicking.
+func TestEmbedAfterSubprocessExitsReturnsError(t *testing.T) {
+	bin := testutil.BuildMockEmbedder(t)
+	emb, err := Start(bin)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if _, err := emb.Embed(Request{ChunkID: "c1", Text: "hello"}); err != nil {
+		t.Fatalf("first Embed (subprocess still alive): %v", err)
+	}
+
+	if err := emb.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := emb.Embed(Request{ChunkID: "c2", Text: "hello again"}); err == nil {
+		t.Fatal("Embed after the subprocess was killed returned nil error, want an error")
+	}
+}

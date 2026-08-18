@@ -249,3 +249,119 @@ func TestLeaderCrashDoesNotLoseSubmittedWork(t *testing.T) {
 		t.Fatal("pending task was not re-offered by the new leader after the old leader crashed")
 	}
 }
+
+// TestStaleHeartbeatTriggersReEnqueue exercises Stage 2's original
+// at-least-once mechanism — a task whose worker stops heartbeating becomes
+// available again — which the Raft-cluster tests above never touched (they
+// only exercise the leader-crash path, a different way a task can need
+// re-offering). checkStalledTasks is called directly instead of waiting
+// CheckInterval/TaskTimeout of real wall-clock time.
+func TestStaleHeartbeatTriggersReEnqueue(t *testing.T) {
+	tc := newTestCluster(t)
+	leader := tc.waitForLeader(t)
+	ctx := testCtx(t)
+
+	submitResp := requireSubmitOK(t, leader.BrokerClient, "payload")
+	pollResp, err := leader.BrokerClient.Poll(ctx, &pb.PollRequest{WorkerId: "worker-a"})
+	if err != nil {
+		t.Fatalf("Poll RPC error: %v", err)
+	}
+	if !pollResp.HasTask || pollResp.Task.Id != submitResp.TaskId {
+		t.Fatalf("expected to poll the submitted task, got has_task=%v", pollResp.HasTask)
+	}
+
+	// Simulate the polling worker going silent: back-date its last
+	// heartbeat past TaskTimeout.
+	leader.srv.mu.Lock()
+	entry, ok := leader.srv.inflight[submitResp.TaskId]
+	if !ok {
+		leader.srv.mu.Unlock()
+		t.Fatal("task is not tracked as inflight after Poll")
+	}
+	entry.lastHeartbeat = time.Now().Add(-(TaskTimeout + time.Second))
+	leader.srv.mu.Unlock()
+
+	leader.srv.checkStalledTasks()
+
+	pollResp2, err := leader.BrokerClient.Poll(ctx, &pb.PollRequest{WorkerId: "worker-b"})
+	if err != nil {
+		t.Fatalf("second Poll RPC error: %v", err)
+	}
+	if !pollResp2.HasTask || pollResp2.Task.Id != submitResp.TaskId {
+		t.Fatalf("stalled task was not re-offered: has_task=%v", pollResp2.HasTask)
+	}
+}
+
+// TestSubmitTimesOutWithoutQuorum exercises proposeAndWait's timeout path,
+// previously uncovered: a leader that can't reach a majority (isolated from
+// both followers, so it locally still believes it's leader — nothing tells
+// it otherwise — but can never commit anything new) must eventually give up
+// and report ok=false rather than blocking forever. Takes ~5s (commitTimeout).
+func TestSubmitTimesOutWithoutQuorum(t *testing.T) {
+	tc := newTestCluster(t)
+	leader := tc.waitForLeader(t)
+	leaderID := tc.leaderID()
+
+	tc.isolate(leaderID)
+
+	start := time.Now()
+	resp, err := leader.BrokerClient.Submit(testCtx(t), &pb.SubmitRequest{Payload: "payload"})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Submit RPC error: %v", err)
+	}
+	if resp.Ok {
+		t.Fatal("Submit on an isolated (quorum-less) leader returned ok=true, want false after timing out")
+	}
+	if elapsed < 4*time.Second {
+		t.Errorf("Submit returned after only %s, want it to have waited out the ~5s commit timeout", elapsed)
+	}
+}
+
+func TestGetResultUnknownTaskIDIsNotDone(t *testing.T) {
+	tc := newTestCluster(t)
+	leader := tc.waitForLeader(t)
+
+	resp, err := leader.BrokerClient.GetResult(testCtx(t), &pb.GetResultRequest{TaskId: "never-submitted"})
+	if err != nil {
+		t.Fatalf("GetResult RPC error: %v", err)
+	}
+	if resp.Done {
+		t.Error("GetResult for an unknown task ID reported done=true, want false")
+	}
+}
+
+// TestDoubleCompleteIsIdempotent covers the case the at-least-once design
+// relies on: two workers both finish the same re-enqueued task and both
+// call Complete. The second call must not error or corrupt state.
+func TestDoubleCompleteIsIdempotent(t *testing.T) {
+	tc := newTestCluster(t)
+	leader := tc.waitForLeader(t)
+	ctx := testCtx(t)
+
+	submitResp := requireSubmitOK(t, leader.BrokerClient, "payload")
+
+	resp1, err := leader.BrokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: submitResp.TaskId, WorkerId: "w1"})
+	if err != nil {
+		t.Fatalf("first Complete RPC error: %v", err)
+	}
+	if !resp1.Ok {
+		t.Fatal("first Complete: got ok=false, want true")
+	}
+
+	resp2, err := leader.BrokerClient.Complete(ctx, &pb.CompleteRequest{TaskId: submitResp.TaskId, WorkerId: "w2"})
+	if err != nil {
+		t.Fatalf("second Complete RPC error: %v", err)
+	}
+	if !resp2.Ok {
+		t.Fatal("second Complete (duplicate) : got ok=false, want true (must be idempotent, not an error)")
+	}
+
+	getResp, err := leader.BrokerClient.GetResult(ctx, &pb.GetResultRequest{TaskId: submitResp.TaskId})
+	if err != nil {
+		t.Fatalf("GetResult RPC error: %v", err)
+	}
+	if !getResp.Done {
+		t.Error("task not reported done after two Complete calls")
+	}
+}

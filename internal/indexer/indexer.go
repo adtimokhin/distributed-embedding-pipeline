@@ -37,9 +37,18 @@ type Chunk struct {
 }
 
 // ChunkText splits text into passages of at most maxWords words. Word
-// boundaries are Unicode whitespace.
+// boundaries are Unicode whitespace. maxWords <= 0 is treated as "don't
+// split" (the whole text as one chunk) rather than looping forever — the
+// loop below advances by maxWords each iteration, so a non-positive step
+// would never reach len(words).
 func ChunkText(text string, maxWords int) []string {
 	words := strings.FieldsFunc(text, unicode.IsSpace)
+	if len(words) == 0 {
+		return nil
+	}
+	if maxWords <= 0 {
+		return []string{strings.Join(words, " ")}
+	}
 	var chunks []string
 	for i := 0; i < len(words); i += maxWords {
 		end := i + maxWords

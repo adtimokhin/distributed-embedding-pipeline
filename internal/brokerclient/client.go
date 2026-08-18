@@ -72,6 +72,10 @@ func (c *Client) addrIndex(addr string) int {
 // address instead" and err non-nil means "could not complete the call at
 // all" (network error). Both are treated as reasons to try the next node.
 func (c *Client) call(fn func(pb.BrokerClient) (redirectAddr string, err error)) error {
+	if len(c.addrs) == 0 {
+		return fmt.Errorf("brokerclient: no broker addresses configured")
+	}
+
 	maxHops := 2 * len(c.addrs)
 	if maxHops < 2 {
 		maxHops = 2

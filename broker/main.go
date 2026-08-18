@@ -269,26 +269,34 @@ func (s *brokerServer) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*
 	return &pb.HeartbeatResponse{Ok: true}, nil
 }
 
-// reEnqueueStalled is the background goroutine that scans inflight tasks and
-// drops any that have not sent a heartbeat within TaskTimeout. Dropping the
-// entry IS the re-enqueue: Poll's scan treats anything not in inflight (and
-// not done) as available again.
+// reEnqueueStalled is the background goroutine that periodically scans
+// inflight tasks for ones that have gone stale. Split out from
+// checkStalledTasks so tests can trigger a single scan synchronously
+// instead of waiting CheckInterval/TaskTimeout of real wall-clock time.
 func (s *brokerServer) reEnqueueStalled() {
 	ticker := time.NewTicker(CheckInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		if !s.refreshLeaderState() {
-			continue
+		s.checkStalledTasks()
+	}
+}
+
+// checkStalledTasks drops any inflight task that has not sent a heartbeat
+// within TaskTimeout. Dropping the entry IS the re-enqueue: Poll's scan
+// treats anything not in inflight (and not done) as available again. No-op
+// unless this node is currently the leader — inflight is only meaningful there.
+func (s *brokerServer) checkStalledTasks() {
+	if !s.refreshLeaderState() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, e := range s.inflight {
+		if time.Since(e.lastHeartbeat) > TaskTimeout {
+			log.Printf("node %d: re-enqueuing stalled task %s (worker %s, silent for %s)",
+				s.id, id, e.workerID, time.Since(e.lastHeartbeat).Round(time.Second))
+			delete(s.inflight, id)
 		}
-		s.mu.Lock()
-		for id, e := range s.inflight {
-			if time.Since(e.lastHeartbeat) > TaskTimeout {
-				log.Printf("node %d: re-enqueuing stalled task %s (worker %s, silent for %s)",
-					s.id, id, e.workerID, time.Since(e.lastHeartbeat).Round(time.Second))
-				delete(s.inflight, id)
-			}
-		}
-		s.mu.Unlock()
 	}
 }
 

@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -212,4 +213,86 @@ func TestHandleHealthz(t *testing.T) {
 	if rec.Body.String() != "ok" {
 		t.Errorf("body = %q, want %q", rec.Body.String(), "ok")
 	}
+}
+
+// ── Edge cases: explicit boundary values ────────────────────────────────────
+
+func TestHandleSearchTopKBoundaries(t *testing.T) {
+	cases := []struct {
+		name      string
+		topK      int
+		wantLimit uint64
+	}{
+		{"omitted (zero value)", 0, defaultTopK},
+		{"explicit negative", -5, defaultTopK},
+		{"exactly at max", maxTopK, maxTopK},
+		{"one over max", maxTopK + 1, maxTopK},
+		{"typical value", 7, 7},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, fp := newTestServer(t)
+			body := fmt.Sprintf(`{"query":"hello","top_k":%d}`, c.topK)
+			rec := doRequest(t, srv.handleSearch, http.MethodPost, body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if fp.lastSearch.Limit != c.wantLimit {
+				t.Errorf("Limit = %d, want %d", fp.lastSearch.Limit, c.wantLimit)
+			}
+		})
+	}
+}
+
+func TestHandleIngestChunkSizeBoundaries(t *testing.T) {
+	cases := []struct {
+		name            string
+		chunkSize       int
+		text            string
+		wantUpsertCalls int
+	}{
+		{"omitted uses default 200", 0, "one two three", 1},
+		{"explicit negative uses default 200", -10, "one two three", 1},
+		{"explicit small value splits", 1, "one two three", 3},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, fp := newTestServer(t)
+			body := fmt.Sprintf(`{"doc_id":"d1","text":%q,"chunk_size":%d}`, c.text, c.chunkSize)
+			rec := doRequest(t, srv.handleIngest, http.MethodPost, body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if fp.upsertCount != c.wantUpsertCalls {
+				t.Errorf("Upsert called %d times, want %d", fp.upsertCount, c.wantUpsertCalls)
+			}
+		})
+	}
+}
+
+// TestHandleSearchQdrantErrorReturns500 verifies a Qdrant-layer failure
+// surfaces as a 500 with an error body, not a panic or a silent empty result.
+func TestHandleSearchQdrantErrorReturns500(t *testing.T) {
+	bin := testutil.BuildMockEmbedder(t)
+	emb, err := embedder.Start(bin)
+	if err != nil {
+		t.Fatalf("start embedder: %v", err)
+	}
+	t.Cleanup(func() { emb.Close() }) //nolint:errcheck
+
+	srv := &server{pointsClient: &erroringPointsClient{}, emb: emb}
+	rec := doRequest(t, srv.handleSearch, http.MethodPost, `{"query":"hello"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+type erroringPointsClient struct {
+	qdrant.PointsClient
+}
+
+func (f *erroringPointsClient) Search(_ context.Context, _ *qdrant.SearchPoints, _ ...grpc.CallOption) (*qdrant.SearchResponse, error) {
+	return nil, fmt.Errorf("qdrant unavailable")
 }
