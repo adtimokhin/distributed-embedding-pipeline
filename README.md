@@ -123,7 +123,6 @@ Scaling was negative, not just sub-linear: 4 containers on one host compete for 
 ## File structure
 
 ```
-hw4/
 ├── broker/main.go              ← implementation (Raft-replicated state machine + gRPC wiring)
 ├── worker/main.go              ← implementation
 ├── producer/main.go            ← implementation
@@ -141,8 +140,7 @@ hw4/
 ├── Dockerfile.broker           ← implementation (Stage 3)
 ├── Dockerfile.worker           ← implementation (Stage 3)
 ├── docker-compose.yml          ← implementation (Stage 3) — broker0/broker1/broker2 + qdrant + worker
-├── proto/, corpus/, tools/     ← provided, unmodified (proto/raft.proto copied from HW3 alongside the provided broker.proto)
-└── REFLECTIONS.md
+└── proto/, corpus/, tools/     ← provided, unmodified (proto/raft.proto copied from HW3 alongside the provided broker.proto)
 ```
 
-See [REFLECTIONS.md](REFLECTIONS.md) for the full delivery-semantics trace, the comparison with HW3's Raft-based approach to fault tolerance, and the throughput-scaling analysis. See [TO_TEST.md](TO_TEST.md) for test coverage by package and remaining gaps.
+See [TO_TEST.md](TO_TEST.md) for test coverage by package and remaining gaps, and [TO_IMPLEMENT.md](TO_IMPLEMENT.md) for the scoping behind the RAG-usability additions (persistent embedder, HTTP retrieval/ingestion API).
