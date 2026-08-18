@@ -16,9 +16,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"pipeline/internal/brokerclient"
+	"pipeline/internal/indexer"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -29,33 +29,6 @@ type article struct {
 	ID    string `json:"id"`
 	Title string `json:"title"`
 	Text  string `json:"text"`
-}
-
-// taskPayload is what we encode in the broker task payload.
-type taskPayload struct {
-	DocID   string `json:"doc_id"`
-	ChunkID string `json:"chunk_id"`
-	Title   string `json:"title"`
-	Text    string `json:"text"`
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Chunking
-// ──────────────────────────────────────────────────────────────────────────────
-
-// chunkText splits text into passages of at most maxWords words.
-// Word boundaries are Unicode whitespace.
-func chunkText(text string, maxWords int) []string {
-	words := strings.FieldsFunc(text, unicode.IsSpace)
-	var chunks []string
-	for i := 0; i < len(words); i += maxWords {
-		end := i + maxWords
-		if end > len(words) {
-			end = len(words)
-		}
-		chunks = append(chunks, strings.Join(words[i:end], " "))
-	}
-	return chunks
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -92,8 +65,8 @@ func run(corpusPath string, brokerAddrs []string, chunkSize int) error {
 		}
 		articleCount++
 
-		for i, passage := range chunkText(art.Text, chunkSize) {
-			p := taskPayload{
+		for i, passage := range indexer.ChunkText(art.Text, chunkSize) {
+			p := indexer.Chunk{
 				DocID:   art.ID,
 				ChunkID: art.ID + "-" + strconv.Itoa(i),
 				Title:   art.Title,

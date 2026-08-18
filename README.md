@@ -10,7 +10,7 @@ A distributed pipeline that chunks Wikipedia articles, fans the chunks out to a 
 | **Worker** (`worker/`) | Polls the broker (via `internal/brokerclient`, which follows leader redirects), drives a long-lived embedder subprocess, writes vectors directly to Qdrant. |
 | **Producer** (`producer/`) | Reads the corpus, chunks articles to ≤200 words, submits tasks, polls for completion. |
 | **Query CLI** (`query/`) | Embeds a query string, runs kNN search against Qdrant, prints top-k results. |
-| **Query server** (`queryserver/`) | HTTP retrieval API — `POST /search {"query", "top_k"}` → JSON results — for calling into the index from an agent/RAG system instead of a CLI. Same embed+search logic as the CLI (`internal/retrieval`), served from a long-lived process instead of a one-shot invocation. |
+| **Query server** (`queryserver/`) | HTTP API — `POST /search {"query", "top_k"}` for retrieval, `POST /ingest {"doc_id", "title", "text"}` for synchronous single-document indexing — for calling into the index from an agent/RAG system instead of a CLI or the batch pipeline. Same embed+search logic as the CLI (`internal/retrieval`) and same chunk/embed/upsert logic as the worker (`internal/indexer`), served from a long-lived process instead of a one-shot invocation. |
 
 ## Quick start
 
@@ -45,6 +45,20 @@ curl localhost:8080/healthz
 
 The embedder subprocess and Qdrant connection are established once at startup and held for the server's lifetime — unlike the CLI, which is a one-shot process, this is what actually makes "don't reload the model per query" observable. `Embed` is mutex-guarded so concurrent requests can't interleave on the subprocess's stdin/stdout.
 
+`/ingest` adds one document without touching the broker at all — chunk → embed → upsert inline, synchronously:
+
+```bash
+curl -X POST localhost:8080/ingest -d '{
+  "doc_id": "agent-doc-1",
+  "title": "Notes on Paxos",
+  "text": "Paxos is a family of protocols for solving consensus...",
+  "chunk_size": 200
+}'
+# {"doc_id": "agent-doc-1", "chunk_ids": ["agent-doc-1-0", "agent-doc-1-1", ...]}
+```
+
+`chunk_size` is optional (defaults to 200 words, matching the producer). Re-ingesting the same `doc_id` overwrites its chunks rather than duplicating them (same deterministic point-ID scheme the batch path relies on for idempotent retries) — but if the new text produces fewer chunks than the old version, stale trailing chunks aren't cleaned up; there's no delete path yet. `/ingest` and the batch broker/worker/producer pipeline write into the same Qdrant collection and coexist without interference — verified by ingesting through both paths and confirming both show up in `/search`.
+
 ### Docker Compose (Stage 3)
 
 ```bash
@@ -74,6 +88,7 @@ One worker-lifetime subprocess speaks line-delimited JSON on stdin/stdout:
 - **The broker is a 3-node Raft-replicated cluster (extension), not a single in-memory process.** `Submit` and `Complete` are proposed as Raft log entries and block until committed to a majority — these are the two facts that must survive a crash ("this task exists," "this task is done"), since losing either drops work forever or leaves the producer polling `GetResult` on an orphaned ID forever. `Poll`'s task→worker assignment and `Heartbeat`'s liveness tracking are deliberately *not* replicated: they're leader-local, ephemeral scheduling state. If the leader crashes, in-flight assignments are simply forgotten and the new leader treats every submitted-but-not-done task as available again — safe for exactly the same reason re-execution is already safe within a single broker (see the at-least-once bullet above). This keeps Poll/Heartbeat cheap (no consensus round trip on a 100ms poll loop) and means "pending" is a derived view rather than stored state: scan submitted tasks in commit order, skip anything done or currently in-flight. `worker`/`producer` no longer dial a fixed broker address — `internal/brokerclient` takes a list of cluster addresses and follows `redirect_addr` responses (or, if a redirect names an address the caller can't itself resolve — e.g. a Docker-internal hostname reported to a host-invoked producer — falls back to round-robining its own known address list) to find the current leader.
 - **The embedder subprocess is a shared, reusable component (`internal/embedder`), not duplicated per binary.** `worker/main.go` originally had its own private spawn-once-reuse-for-lifetime subprocess type; `query/main.go` originally spawned and killed a fresh subprocess *per query*, which is fine for an infrequent CLI call but pays model-load latency on every call — unusable for something an agent calls repeatedly. Both now share one `Embedder` type. Making it shared also surfaced a real bug before it shipped: the original type had no concurrency guard, which was harmless when only one goroutine ever called `embed` (the worker's sequential poll loop) but would silently interleave requests/responses once `queryserver` started calling it from multiple HTTP handler goroutines at once. `Embed` now holds a mutex for the full request/response round trip.
 - **Retrieval is exposed as `queryserver`'s HTTP API, not just the `query` CLI.** Both share `internal/retrieval`'s embed-then-search logic; the CLI is a thin one-shot wrapper around it, `queryserver` holds the embedder and Qdrant connection open across requests. This is the actual point at which the index becomes something a RAG agent can call synchronously, rather than something you inspect by hand.
+- **Single-document ingestion (`queryserver`'s `/ingest`) bypasses the broker entirely.** `chunkIDToUUID`/`upsertVector`/`chunkText` originally lived as private, near-duplicated code inside `worker/main.go` and `producer/main.go`; both now share one `internal/indexer` package, which also gained `IngestDocument` (chunk → embed → upsert, inline, for one document) and `EnsureCollection` (idempotent create-if-missing, needed because `queryserver` might now be the *first* process to ever touch Qdrant, not just the worker). The broker's `Submit`/`Poll`/`Complete` machinery — durable, fault-tolerant, built for bulk batches of thousands of chunks — is the wrong tool for "an agent just produced one document, index it now": standing up that whole path for a single write adds latency and a dependency on broker availability that a synchronous local chunk/embed/upsert doesn't need. The two paths write into the same collection using the same deterministic chunk-ID scheme, so they coexist safely and a document ingested via `/ingest` is immediately visible to `/search` and to anything the batch pipeline indexes later.
 
 ## Scaling result (Stage 3, 1 vs. 4 workers)
 
@@ -100,6 +115,7 @@ hw4/
 ├── internal/brokerclient/      ← implementation — shared leader-discovery/redirect client (worker + producer)
 ├── internal/embedder/          ← implementation — shared long-lived embedder subprocess (worker, query, queryserver)
 ├── internal/retrieval/         ← implementation — shared embed+kNN-search logic (query, queryserver)
+├── internal/indexer/           ← implementation — shared chunk/embed/upsert logic (worker, producer, queryserver's /ingest)
 ├── raft/, config/, internal/log/ ← copied from HW3 (own module, so vendored not imported); raft.go unmodified
 ├── broker_nodeconfig.json      ← implementation — local 3-node cluster addresses
 ├── broker_nodeconfig-docker.json ← implementation — Docker Compose cluster addresses
