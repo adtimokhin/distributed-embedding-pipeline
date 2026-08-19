@@ -1,4 +1,4 @@
-# HW4 — Distributed Document Embedding Pipeline
+# Distributed Document Embedding Pipeline
 
 A distributed pipeline that chunks Wikipedia articles, fans the chunks out to a pool of workers for vector embedding, and stores the results in Qdrant for kNN search. Stages 1–3 (core pipeline, at-least-once delivery, containerized deployment) are complete. The broker is a Raft-replicated 3-node cluster (extension, reusing HW3's `raft` package) rather than a single in-memory process — see "Raft-replicated broker" below.
 
